@@ -191,3 +191,20 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ── Keep-alive web server (prevents Render free tier from sleeping) ────────────
+from threading import Thread
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+class _Ping(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, *args): pass
+
+def _keep_alive():
+    HTTPServer(("0.0.0.0", 8080), _Ping).serve_forever()
+
+Thread(target=_keep_alive, daemon=True).start()
