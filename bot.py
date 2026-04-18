@@ -1,3 +1,9 @@
+import base64 as _b64, os as _os
+for _env, _fname in [("GOOGLE_CREDENTIALS_B64","google_credentials.json"),("GOOGLE_TOKEN_B64","google_token.pickle")]:
+    _val = _os.environ.get(_env)
+    if _val and not _os.path.exists(_fname):
+        with open(_fname,"wb") as _f: _f.write(_b64.b64decode(_val))
+
 import os, logging, base64, json, re, pickle, inspect, io
 from datetime import datetime
 import httpx
