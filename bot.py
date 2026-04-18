@@ -6,6 +6,8 @@ for _env, _fname in [("GOOGLE_CREDENTIALS_B64","google_credentials.json"),("GOOG
 
 import os, logging, base64, json, re, pickle, inspect, io
 from datetime import datetime
+from threading import Thread
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import httpx
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -179,7 +181,14 @@ async def on_voice(update, context):
         return extract_audio(data, mime)
     await process(update, ext)
 
+class _Ping(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
+    def log_message(self, *args): pass
+
 def main():
+    Thread(target=lambda: HTTPServer(("0.0.0.0", 8080), _Ping).serve_forever(), daemon=True).start()
+    logger.info("Keep-alive server started on port 8080")
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
@@ -191,20 +200,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-# ── Keep-alive web server (prevents Render free tier from sleeping) ────────────
-from threading import Thread
-from http.server import HTTPServer, BaseHTTPRequestHandler
-
-class _Ping(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
-    def log_message(self, *args): pass
-
-def _keep_alive():
-    HTTPServer(("0.0.0.0", 8080), _Ping).serve_forever()
-
-Thread(target=_keep_alive, daemon=True).start()
