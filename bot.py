@@ -148,7 +148,7 @@ def make_auth_url(telegram_id: int) -> str:
     auth_url, state = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
-        prompt="consent",
+        prompt="select_account consent",
         state=str(telegram_id)
     )
     pending_flows[str(telegram_id)] = flow
