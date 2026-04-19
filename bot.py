@@ -278,13 +278,16 @@ class Handler(BaseHTTPRequestHandler):
             params = parse_qs(parsed.query)
             state = params.get("state", [None])[0]
             code  = params.get("code",  [None])[0]
-            if state and code and state in pending_flows:
+            if state and code:
                 try:
+                    if state not in pending_flows:
+                        self._respond(200, b"<html><body style='font-family:Arial;text-align:center;padding:40px'><h2>Session expired</h2><p>Go back to Telegram and send /start to get a new login link.</p></body></html>")
+                        return
                     flow = pending_flows.pop(state)
                     flow.fetch_token(code=code)
                     creds = flow.credentials
                     save_user_creds(int(state), creds)
-                    self._respond(200, b"<h2>Connected! Go back to Telegram and send your tasks.</h2>")
+                    self._respond(200, b"<html><body style='font-family:Arial;text-align:center;padding:40px'><h2 style='color:green'>&#10003; Connected!</h2><p>Your Google Calendar is connected.</p><p>Go back to Telegram and send your first task!</p></body></html>")
                     if telegram_app:
                         import asyncio
                         asyncio.run_coroutine_threadsafe(
