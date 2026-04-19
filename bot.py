@@ -267,6 +267,13 @@ telegram_app = None
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
+        if parsed.path == "/ping":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"OK")
+            return
         if parsed.path == "/oauth/callback":
             params = parse_qs(parsed.query)
             state = params.get("state", [None])[0]
