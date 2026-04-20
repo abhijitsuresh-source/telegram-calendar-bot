@@ -170,7 +170,7 @@ def parse_edit_instruction(instruction: str, events: list) -> dict:
 # ── Supabase helpers ───────────────────────────────────────────────────────────
 def get_user_creds(telegram_id: int):
     r = supabase.table("users").select("token_json").eq("telegram_id", telegram_id).execute()
-    if not r.data or not r.data[0]["token_json"]:
+    if not r.data or not r.data[0].get("token_json"):
         return None
     info = json.loads(r.data[0]["token_json"])
     creds = Credentials(
@@ -204,7 +204,7 @@ def save_user_creds(telegram_id: int, creds: Credentials):
 def disconnect_user(telegram_id: int) -> bool:
     existing = supabase.table("users").select("telegram_id").eq("telegram_id", telegram_id).execute()
     if existing.data:
-        supabase.table("users").update({"token_json": None, "connected": False}).eq("telegram_id", telegram_id).execute()
+        supabase.table("users").update({"token_json": "", "connected": False}).eq("telegram_id", telegram_id).execute()
         return True
     return False
 
