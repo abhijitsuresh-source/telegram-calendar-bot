@@ -419,25 +419,25 @@ async def handle_edit_or_delete(update: Update, text: str, telegram_id: int):
 # ── Telegram handlers ──────────────────────────────────────────────────────────
 WELCOME_MESSAGE = """👋 *Welcome to CalendarBot!*
 
-I turn your messages into Google Calendar events automatically.
+Send me your tasks and appointments in any format — I'll extract the details and add them to your Google Calendar automatically, with reminders 15 min and 5 min before every event.
 
-*What I can do:*
-📝 Add events from text
-🎤 Transcribe voice messages and add events
-🖼 Read photos of whiteboards or handwritten notes
-📄 Extract events from PDFs
-🔁 Create recurring events
-✏️ Edit or delete your events
-🔔 Set reminders at 15 min and 5 min before
+*Ways to send tasks:*
+📝 *Text* — type your task naturally
+🎤 *Voice note* — speak it out loud
+🖼 *Photo* — whiteboard, sticky note, handwritten list, screenshot
+📄 *PDF* — meeting notes, documents, any file with dates
 
-*How to use me:*
-Just talk naturally! For example:
-• _"Dentist tomorrow at 3pm"_
-• _"Team standup every Monday at 10am"_
-• _"Change my dentist to 4pm"_
-• _"Delete my Monday meeting"_
-• _"Show my upcoming events"_
-• _"Disconnect my Google account"_
+*Examples of what to say:*
+- _"Dentist tomorrow at 3pm"_
+- _"Team standup every Monday at 10am"_
+- _"Submit report by Friday EOD"_
+- _"Client dinner on April 25th"_
+
+*Managing your events:*
+- _"Change my dentist to 4pm"_
+- _"Delete my Monday meeting"_
+- _"Show my upcoming events"_
+- _"Disconnect my Google account"_
 
 First, connect your Google Calendar below 👇"""
 
