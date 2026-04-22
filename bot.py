@@ -31,10 +31,28 @@ RENDER_URL        = os.environ["RENDER_URL"]
 GOOGLE_CREDS_FILE = os.environ.get("GOOGLE_CREDENTIALS_FILE", "google_credentials.json")
 GOOGLE_CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID", "primary")
 TIMEZONE          = os.environ.get("TIMEZONE", "Asia/Kolkata")
-SCOPES            = ["https://www.googleapis.com/auth/calendar"]
+SCOPES            = ["https://www.googleapis.com/auth/calendar.events"]
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 supabase    = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# ── Token encryption (AES-256) ────────────────────────────────────────────────
+from cryptography.fernet import Fernet
+import base64 as _b64enc, hashlib as _hs
+
+def _fernet():
+    raw = os.environ.get("TOKEN_ENCRYPT_KEY", "")
+    if not raw:
+        raise ValueError("TOKEN_ENCRYPT_KEY env var not set")
+    key = _b64enc.urlsafe_b64encode(_hs.sha256(raw.encode()).digest())
+    return Fernet(key)
+
+def encrypt_token(data: str) -> str:
+    return _fernet().encrypt(data.encode()).decode()
+
+def decrypt_token(data: str) -> str:
+    return _fernet().decrypt(data.encode()).decode()
+
 
 # ── Prompts ────────────────────────────────────────────────────────────────────
 EXTRACT_PROMPT = """You are a task/event extraction assistant.
@@ -188,13 +206,13 @@ def get_user_creds(telegram_id: int):
 
 def save_user_creds(telegram_id: int, creds: Credentials):
     token_json = json.dumps({
-        "token": creds.token,
         "refresh_token": creds.refresh_token,
         "token_uri": creds.token_uri,
         "client_id": creds.client_id,
         "client_secret": creds.client_secret,
         "scopes": list(creds.scopes or SCOPES),
     })
+    token_json = encrypt_token(token_json)
     existing = supabase.table("users").select("telegram_id").eq("telegram_id", telegram_id).execute()
     if existing.data:
         supabase.table("users").update({"token_json": token_json, "connected": True}).eq("telegram_id", telegram_id).execute()
@@ -202,8 +220,26 @@ def save_user_creds(telegram_id: int, creds: Credentials):
         supabase.table("users").insert({"telegram_id": telegram_id, "token_json": token_json, "connected": True}).execute()
 
 def disconnect_user(telegram_id: int) -> bool:
-    existing = supabase.table("users").select("telegram_id").eq("telegram_id", telegram_id).execute()
+    existing = supabase.table("users").select("token_json").eq("telegram_id", telegram_id).execute()
     if existing.data:
+        raw_token = existing.data[0].get("token_json", "")
+        if raw_token:
+            try:
+                info = json.loads(decrypt_token(raw_token))
+                refresh_token = info.get("refresh_token")
+                if refresh_token:
+                    import urllib.request, urllib.parse
+                    data = urllib.parse.urlencode({"token": refresh_token}).encode()
+                    req = urllib.request.Request(
+                        "https://oauth2.googleapis.com/revoke", data=data,
+                        headers={"Content-Type": "application/x-www-form-urlencoded"})
+                    try:
+                        urllib.request.urlopen(req, timeout=5)
+                        logger.info(f"Google token revoked for {telegram_id}")
+                    except Exception as e:
+                        logger.warning(f"Google revoke failed: {e}")
+            except Exception as e:
+                logger.warning(f"Could not decrypt for revocation: {e}")
         supabase.table("users").update({"token_json": "", "connected": False}).eq("telegram_id", telegram_id).execute()
         return True
     return False
