@@ -36,15 +36,21 @@ SCOPES            = ["https://www.googleapis.com/auth/calendar.events"]
 groq_client = Groq(api_key=GROQ_API_KEY)
 supabase    = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ── Token encryption (AES-256) ────────────────────────────────────────────────
+# ── Token encryption (AES-256 + PBKDF2 key derivation) ───────────────────────
 from cryptography.fernet import Fernet
 import base64 as _b64enc, hashlib as _hs
+
+# Salt is fixed (public) — security comes from PBKDF2 iteration count.
+# To rotate the key: change TOKEN_ENCRYPT_KEY and re-encrypt all rows in Supabase.
+_PBKDF2_SALT       = b"calendarbot-v1"
+_PBKDF2_ITERATIONS = 260_000          # OWASP 2023 recommendation for SHA-256
 
 def _fernet():
     raw = os.environ.get("TOKEN_ENCRYPT_KEY", "")
     if not raw:
         raise ValueError("TOKEN_ENCRYPT_KEY env var not set")
-    key = _b64enc.urlsafe_b64encode(_hs.sha256(raw.encode()).digest())
+    dk  = _hs.pbkdf2_hmac("sha256", raw.encode(), _PBKDF2_SALT, _PBKDF2_ITERATIONS, dklen=32)
+    key = _b64enc.urlsafe_b64encode(dk)
     return Fernet(key)
 
 def encrypt_token(data: str) -> str:
@@ -190,9 +196,10 @@ def get_user_creds(telegram_id: int):
     r = supabase.table("users").select("token_json").eq("telegram_id", telegram_id).execute()
     if not r.data or not r.data[0].get("token_json"):
         return None
-    info = json.loads(r.data[0]["token_json"])
+    raw = decrypt_token(r.data[0]["token_json"])
+    info = json.loads(raw)
     creds = Credentials(
-        token=info.get("token"),
+        token=None,                        # never persist access token
         refresh_token=info.get("refresh_token"),
         token_uri=info.get("token_uri"),
         client_id=info.get("client_id"),
