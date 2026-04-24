@@ -223,12 +223,18 @@ def get_user_creds(telegram_id: int):
         return None
     raw = decrypt_token(r.data[0]["token_json"])
     info = json.loads(raw)
+    # Always use the current client_id/client_secret from the credentials file,
+    # not the potentially stale ones stored in Supabase. This prevents
+    # invalid_client errors if the secret is ever rotated.
+    with open(GOOGLE_CREDS_FILE) as f:
+        gcreds = json.load(f)
+    app = gcreds.get("web") or gcreds.get("installed") or {}
     creds = Credentials(
         token=None,                        # never persist access token
         refresh_token=info.get("refresh_token"),
-        token_uri=info.get("token_uri"),
-        client_id=info.get("client_id"),
-        client_secret=info.get("client_secret"),
+        token_uri=app.get("token_uri", info.get("token_uri")),
+        client_id=app.get("client_id", info.get("client_id")),
+        client_secret=app.get("client_secret", info.get("client_secret")),
         scopes=info.get("scopes"),
     )
     if creds.expired and creds.refresh_token:
@@ -273,6 +279,10 @@ def disconnect_user(telegram_id: int) -> bool:
             except Exception as e:
                 logger.warning(f"Could not decrypt for revocation: {e}")
         supabase.table("users").update({"token_json": "", "connected": False}).eq("telegram_id", telegram_id).execute()
+        # Cancel all pending invites from this organiser immediately
+        supabase.table("invites").update({"status": "cancelled"}).eq(
+            "organiser_telegram_id", telegram_id).eq("status", "pending").execute()
+        logger.info(f"Cancelled all pending invites for {telegram_id}")
         return True
     return False
 
@@ -285,12 +295,37 @@ def create_invite(organiser_id: int, event_data: dict, event_link: str) -> str:
         "event_data": json.dumps(event_data),
         "event_link": event_link,
         "status": "pending",
+        "invitee_name": event_data.get("invitee_name", "Someone"),
     }).execute()
     return token
 
 def get_invite(token: str) -> dict | None:
     r = supabase.table("invites").select("*").eq("token", token).execute()
     return r.data[0] if r.data else None
+
+def is_invite_valid(invite: dict) -> tuple[bool, str]:
+    """Returns (is_valid, reason). Checks organiser connection, status, and event date."""
+    if not invite or invite["status"] != "pending":
+        return False, "This invite link has already been used or doesn't exist."
+    # Check organiser is still connected
+    organiser_id = invite["organiser_telegram_id"]
+    r = supabase.table("users").select("connected").eq("telegram_id", organiser_id).execute()
+    if not r.data or not r.data[0].get("connected"):
+        return False, "The organiser has disconnected their Google Calendar. This invite is no longer valid."
+    # Check event date has not passed
+    try:
+        ev = json.loads(invite["event_data"])
+        event_date = datetime.strptime(ev["date"], "%Y-%m-%d").date()
+        if event_date < datetime.now().date():
+            return False, "This event has already passed. The invite is no longer valid."
+    except Exception:
+        pass
+    return True, ""
+
+def get_pending_invites(organiser_id: int) -> list:
+    r = supabase.table("invites").select("*").eq(
+        "organiser_telegram_id", organiser_id).eq("status", "pending").execute()
+    return r.data or []
 
 def update_invite(token: str, status: str, counter_time: str = None, counter_date: str = None, invitee_name: str = None):
     data = {"status": status}
@@ -328,7 +363,6 @@ def make_invite_auth_url(token: str) -> str:
         redirect_uri=f"{RENDER_URL}/invite/callback")
     auth_url, state = flow.authorization_url(
         access_type="offline",
-        include_granted_scopes="true",
         prompt="select_account consent",
         state=token)
     pending_invite_flows[token] = flow
@@ -396,22 +430,20 @@ async def handle_invite(update: Update, text: str, telegram_id: int):
         invite_data = parse_invite(text)
         invitee_name = invite_data.get("invitee_name", "Someone")
 
-        # Create event in organiser's calendar first
-        link = add_event(service, invite_data)
-
-        # Store invite in Supabase
-        token = create_invite(telegram_id, invite_data, link)
+        # Store invite — event is only added to both calendars after invitee accepts
+        token = create_invite(telegram_id, invite_data, "")
         invite_url = f"{RENDER_URL}/invite/{token}"
 
         date_str = invite_data.get("date", "")
         time_str = f" at {invite_data['start_time']}" if invite_data.get("start_time") else ""
 
         await status.edit_text(
-            f"✅ *Event created!*\n\n"
+            f"✅ *Invite created!*\n\n"
             f"• *{invite_data['title']}* — {date_str}{time_str}\n\n"
             f"📨 *Share this invite link with {invitee_name}:*\n"
             f"{invite_url}\n\n"
-            f"_I'll notify you when they accept or respond._",
+            f"_The event will be added to both calendars once they accept._\n"
+            f"_I'll notify you when they respond._",
             parse_mode="Markdown")
 
     except Exception as e:
@@ -499,6 +531,32 @@ async def handle_list(update: Update, telegram_id: int):
         lines.append(f"• *{title}* — {time_display}")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
+CANCEL_INVITE_PROMPT = """You are a calendar invite canceller.
+The user wants to cancel a pending invite. Here are their pending invites:
+
+{invites}
+
+User instruction: {instruction}
+
+Return a JSON object with:
+- "invite_index": 0-based index of the invite to cancel (integer)
+
+Return ONLY valid JSON, no markdown."""
+
+def parse_cancel_invite_instruction(instruction: str, invites: list) -> dict:
+    invite_list = "\n".join([
+        f"{i}. {json.loads(inv['event_data']).get('title','Untitled')} — "
+        f"{json.loads(inv['event_data']).get('date','')} "
+        f"(invited: {inv.get('invitee_name','Someone')})"
+        for i, inv in enumerate(invites)
+    ])
+    r = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": CANCEL_INVITE_PROMPT.format(
+            invites=invite_list, instruction=instruction)}],
+        temperature=0)
+    return parse_json(r.choices[0].message.content)
+
 async def handle_edit_or_delete(update: Update, text: str, telegram_id: int):
     service = get_calendar_service(telegram_id)
     if not service:
@@ -510,15 +568,51 @@ async def handle_edit_or_delete(update: Update, text: str, telegram_id: int):
 
     status = await update.message.reply_text("⏳ Finding your events…")
     events = get_upcoming_events(service, days=14)
-    if not events:
-        await status.edit_text("📅 No upcoming events found in the next 14 days.")
+    pending_invites = get_pending_invites(telegram_id)
+
+    if not events and not pending_invites:
+        await status.edit_text("📅 No upcoming events or pending invites found.")
         return
 
     try:
-        edit_info = parse_edit_instruction(text, events)
-        idx = edit_info.get("event_index", 0)
+        # Try to match against calendar events first
+        edit_info = parse_edit_instruction(text, events) if events else {"event_index": -1, "action": ""}
         action = edit_info.get("action", "")
-        ev = events[idx]
+        idx = edit_info.get("event_index", 0)
+
+        # If it's a delete and we have pending invites, check if it refers to an invite
+        if action == "delete" and pending_invites:
+            # Ask Groq to try matching against invites too
+            cancel_info = parse_cancel_invite_instruction(text, pending_invites)
+            invite_idx = cancel_info.get("invite_index", -1)
+
+            # Simple heuristic: if the text mentions "invite" or a name that matches
+            # an invitee, prefer the invite match
+            text_lower = text.lower()
+            invite_keywords = ["invite", "invitation"]
+            invitee_names = [inv.get("invitee_name", "").lower() for inv in pending_invites]
+            prefers_invite = (
+                any(kw in text_lower for kw in invite_keywords) or
+                any(name and name in text_lower for name in invitee_names)
+            )
+
+            if prefers_invite and 0 <= invite_idx < len(pending_invites):
+                inv = pending_invites[invite_idx]
+                ev_data = json.loads(inv["event_data"])
+                inv_title = ev_data.get("title", "Untitled")
+                inv_name = inv.get("invitee_name", "Someone")
+                supabase.table("invites").update({"status": "cancelled"}).eq(
+                    "token", inv["token"]).execute()
+                await status.edit_text(
+                    f"🗑 Invite for *{inv_title}* with *{inv_name}* has been cancelled.",
+                    parse_mode="Markdown")
+                return
+
+        ev = events[idx] if events and 0 <= idx < len(events) else None
+        if not ev:
+            await status.edit_text("❌ Couldn't find the event. Try being more specific.")
+            return
+
         event_id = ev["id"]
         title = ev.get("summary", "Untitled")
 
@@ -810,9 +904,9 @@ class Handler(BaseHTTPRequestHandler):
         ):
             token = parsed.path.split("/invite/")[-1].strip("/")
             invite = get_invite(token)
-            if not invite or invite["status"] != "pending":
-                self._html(404, _simple_page("❌", "Invite not found",
-                    "This invite link has already been used or doesn't exist."))
+            valid, reason = is_invite_valid(invite)
+            if not valid:
+                self._html(404, _simple_page("❌", "Invite not available", reason))
                 return
             ev = json.loads(invite["event_data"])
             auth_url = make_invite_auth_url(token)
@@ -837,8 +931,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._html(400, _simple_page("❌", "Invalid request", "Something went wrong. Please try the link again."))
                 return
             invite = get_invite(token)
-            if not invite:
-                self._html(404, _simple_page("❌", "Invite expired", "This invite link has already been used."))
+            valid, reason = is_invite_valid(invite)
+            if not valid:
+                self._html(404, _simple_page("❌", "Invite not available", reason))
                 return
             if token not in pending_invite_flows:
                 self._html(400, _simple_page("⏱", "Session expired",
@@ -847,14 +942,39 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 flow = pending_invite_flows.pop(token)
                 flow.fetch_token(code=code)
-                creds = flow.credentials
-                service = build("calendar", "v3", credentials=creds)
+                invitee_creds = flow.credentials
+                invitee_service = build("calendar", "v3", credentials=invitee_creds)
                 ev = json.loads(invite["event_data"])
-                add_event(service, ev)
+
+                # Add event to invitee's calendar
+                add_event(invitee_service, ev)
+
+                # Immediately revoke invitee's Google access — we don't need it anymore
+                try:
+                    import urllib.request, urllib.parse
+                    revoke_token = invitee_creds.refresh_token or invitee_creds.token
+                    if revoke_token:
+                        data = urllib.parse.urlencode({"token": revoke_token}).encode()
+                        req = urllib.request.Request(
+                            "https://oauth2.googleapis.com/revoke", data=data,
+                            headers={"Content-Type": "application/x-www-form-urlencoded"})
+                        urllib.request.urlopen(req, timeout=5)
+                        logger.info(f"Invitee Google token revoked after event add")
+                except Exception as e:
+                    logger.warning(f"Invitee token revoke failed: {e}")
+
+                # Add event to organiser's calendar
+                organiser_id = invite["organiser_telegram_id"]
+                organiser_service = get_calendar_service(organiser_id)
+                if organiser_service:
+                    organiser_link = add_event(organiser_service, ev)
+                    supabase.table("invites").update({"event_link": organiser_link}).eq("token", token).execute()
+                else:
+                    logger.warning(f"Organiser {organiser_id} no longer connected — could not add event to their calendar")
+
                 update_invite(token, "accepted")
 
                 # Notify organiser
-                organiser_id = invite["organiser_telegram_id"]
                 invitee_name = invite.get("invitee_name") or "Someone"
                 ev_title = ev.get("title", "your event")
                 ev_date  = ev.get("date", "")
@@ -866,7 +986,7 @@ class Handler(BaseHTTPRequestHandler):
                             chat_id=organiser_id,
                             text=f"🎉 *{invitee_name} accepted your invite!*\n\n"
                                  f"• *{ev_title}* — {ev_date}{ev_time}\n\n"
-                                 f"The event has been added to their Google Calendar.",
+                                 f"The event has been added to both calendars.",
                             parse_mode="Markdown"),
                         telegram_app.update_queue._loop
                             if hasattr(telegram_app.update_queue, "_loop")
@@ -887,8 +1007,9 @@ class Handler(BaseHTTPRequestHandler):
             counter_time = params.get("time", [None])[0]
             name         = params.get("name", ["Someone"])[0]
             invite = get_invite(token)
-            if not invite:
-                self._html(404, _simple_page("❌", "Invite not found", "This invite link has expired."))
+            valid, reason = is_invite_valid(invite)
+            if not valid:
+                self._html(404, _simple_page("❌", "Invite not available", reason))
                 return
             update_invite(token, "countered",
                 counter_time=counter_time, counter_date=counter_date, invitee_name=name)
@@ -916,8 +1037,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/invite/decline/"):
             token = parsed.path.split("/invite/decline/")[-1].strip("/")
             invite = get_invite(token)
-            if not invite:
-                self._html(404, _simple_page("❌", "Invite not found", "This invite link has expired."))
+            valid, reason = is_invite_valid(invite)
+            if not valid:
+                self._html(404, _simple_page("❌", "Invite not available", reason))
                 return
             update_invite(token, "declined")
             ev = json.loads(invite["event_data"])
@@ -976,7 +1098,11 @@ class Handler(BaseHTTPRequestHandler):
         self._html(200, "<h2>CalendarBot is running!</h2>")
 
     def _html(self, code, body):
-        full = f"<html><body style='font-family:Arial;text-align:center;padding:60px;max-width:500px;margin:auto'>{body}</body></html>"
+        # If body is already a full HTML page, send it as-is
+        if body.lstrip().startswith("<!DOCTYPE") or body.lstrip().startswith("<html"):
+            full = body
+        else:
+            full = f"<html><body style='font-family:Arial;text-align:center;padding:60px;max-width:500px;margin:auto'>{body}</body></html>"
         encoded = full.encode()
         self.send_response(code)
         self.send_header("Content-Type", "text/html")
