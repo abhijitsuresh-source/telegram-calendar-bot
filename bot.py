@@ -90,6 +90,7 @@ INTENT_PROMPT = """You are an intent classifier for a calendar bot.
 Classify the user message into exactly one of these intents:
 
 - ADD_EVENT: user wants to add, create, or schedule something
+- INVITE: user wants to invite someone to a meeting or event (mentions inviting, sharing, or a person's name alongside an event)
 - EDIT_EVENT: user wants to change, update, reschedule, or rename an event
 - DELETE_EVENT: user wants to delete, remove, or cancel an event
 - DISCONNECT: user wants to sign out, disconnect, unlink, or remove their Google account
@@ -115,6 +116,23 @@ Return a JSON object with:
 - "new_title": new title string if renaming (or null)
 
 Return ONLY valid JSON, no markdown."""
+
+INVITE_PROMPT = """You are a calendar invite extractor.
+The user wants to invite someone to an event.
+
+Today is {today}.
+
+Extract the invite details and return ONLY a valid JSON object (no markdown):
+- "title": event title (string)
+- "invitee_name": name of person being invited (string, or "Someone" if not mentioned)
+- "date": YYYY-MM-DD
+- "start_time": HH:MM 24h or null
+- "end_time": HH:MM 24h or null (default 1 hour after start_time)
+- "all_day": true or false
+- "description": any extra context (string, can be "")
+
+Time hints: dinner=19:00, lunch=12:30, morning=09:00, EOD=17:00
+"""
 
 def today_str():
     return datetime.now().strftime("%Y-%m-%d (%A)")
@@ -192,6 +210,13 @@ def parse_edit_instruction(instruction: str, events: list) -> dict:
     return parse_json(r.choices[0].message.content)
 
 # ── Supabase helpers ───────────────────────────────────────────────────────────
+def parse_invite(text: str) -> dict:
+    r = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": INVITE_PROMPT.format(today=today_str()) + "\nUser message: " + text}],
+        temperature=0)
+    return parse_json(r.choices[0].message.content)
+
 def get_user_creds(telegram_id: int):
     r = supabase.table("users").select("token_json").eq("telegram_id", telegram_id).execute()
     if not r.data or not r.data[0].get("token_json"):
@@ -251,6 +276,29 @@ def disconnect_user(telegram_id: int) -> bool:
         return True
     return False
 
+def create_invite(organiser_id: int, event_data: dict, event_link: str) -> str:
+    import secrets
+    token = secrets.token_urlsafe(16)
+    supabase.table("invites").insert({
+        "token": token,
+        "organiser_telegram_id": organiser_id,
+        "event_data": json.dumps(event_data),
+        "event_link": event_link,
+        "status": "pending",
+    }).execute()
+    return token
+
+def get_invite(token: str) -> dict | None:
+    r = supabase.table("invites").select("*").eq("token", token).execute()
+    return r.data[0] if r.data else None
+
+def update_invite(token: str, status: str, counter_time: str = None, counter_date: str = None, invitee_name: str = None):
+    data = {"status": status}
+    if counter_time: data["counter_time"] = counter_time
+    if counter_date: data["counter_date"] = counter_date
+    if invitee_name: data["invitee_name"] = invitee_name
+    supabase.table("invites").update(data).eq("token", token).execute()
+
 def get_calendar_service(telegram_id: int):
     creds = get_user_creds(telegram_id)
     if not creds:
@@ -259,6 +307,7 @@ def get_calendar_service(telegram_id: int):
 
 # ── OAuth ──────────────────────────────────────────────────────────────────────
 pending_flows = {}
+pending_invite_flows = {}  # token -> flow (for invitee OAuth)
 
 def make_auth_url(telegram_id: int) -> str:
     flow = Flow.from_client_secrets_file(
@@ -273,6 +322,18 @@ def make_auth_url(telegram_id: int) -> str:
     return auth_url
 
 # ── Calendar helpers ───────────────────────────────────────────────────────────
+def make_invite_auth_url(token: str) -> str:
+    flow = Flow.from_client_secrets_file(
+        GOOGLE_CREDS_FILE, scopes=SCOPES,
+        redirect_uri=f"{RENDER_URL}/invite/callback")
+    auth_url, state = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="select_account consent",
+        state=token)
+    pending_invite_flows[token] = flow
+    return auth_url
+
 def add_event(service, ev: dict) -> str:
     date_str   = ev["date"]
     start_time = ev.get("start_time")
@@ -321,6 +382,43 @@ async def download(bot, file_id: str) -> bytes:
         r = await c.get(f.file_path); r.raise_for_status(); return r.content
 
 # ── Intent handlers ────────────────────────────────────────────────────────────
+async def handle_invite(update: Update, text: str, telegram_id: int):
+    service = get_calendar_service(telegram_id)
+    if not service:
+        auth_url = make_auth_url(telegram_id)
+        await update.message.reply_text(
+            f"First connect your Google Calendar:\n[Click here to connect]({auth_url})",
+            parse_mode="Markdown")
+        return
+
+    status = await update.message.reply_text("⏳ Creating your invite…")
+    try:
+        invite_data = parse_invite(text)
+        invitee_name = invite_data.get("invitee_name", "Someone")
+
+        # Create event in organiser's calendar first
+        link = add_event(service, invite_data)
+
+        # Store invite in Supabase
+        token = create_invite(telegram_id, invite_data, link)
+        invite_url = f"{RENDER_URL}/invite/{token}"
+
+        date_str = invite_data.get("date", "")
+        time_str = f" at {invite_data['start_time']}" if invite_data.get("start_time") else ""
+
+        await status.edit_text(
+            f"✅ *Event created!*\n\n"
+            f"• *{invite_data['title']}* — {date_str}{time_str}\n\n"
+            f"📨 *Share this invite link with {invitee_name}:*\n"
+            f"{invite_url}\n\n"
+            f"_I'll notify you when they accept or respond._",
+            parse_mode="Markdown")
+
+    except Exception as e:
+        logger.exception("Invite error")
+        await status.edit_text(f"❌ Error creating invite: {e}")
+
+
 async def handle_add(update: Update, extractor, telegram_id: int):
     service = get_calendar_service(telegram_id)
     if not service:
@@ -511,7 +609,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     intent = detect_intent(text)
     logger.info(f"Intent: {intent} for: {text[:50]}")
 
-    if intent == "DISCONNECT":
+    if intent == "INVITE":
+        await handle_invite(update, text, tid)
+    elif intent == "DISCONNECT":
         await handle_disconnect(update, tid)
     elif intent in ("EDIT_EVENT", "DELETE_EVENT"):
         await handle_edit_or_delete(update, text, tid)
@@ -583,7 +683,9 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         intent = detect_intent(transcribed)
         logger.info(f"Voice intent: {intent}")
 
-        if intent == "DISCONNECT":
+        if intent == "INVITE":
+            await handle_invite(update, transcribed, tid)
+        elif intent == "DISCONNECT":
             await handle_disconnect(update, tid)
         elif intent in ("EDIT_EVENT", "DELETE_EVENT"):
             await handle_edit_or_delete(update, transcribed, tid)
@@ -599,6 +701,97 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Web server ─────────────────────────────────────────────────────────────────
 telegram_app = None
 
+# ── Invite page HTML helpers ──────────────────────────────────────────────────
+def _invite_page(title, date_str, time_str, invitee_name, token, auth_url):
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>CalendarBot Invite</title>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet"/>
+  <style>
+    *{{box-sizing:border-box;margin:0;padding:0}}
+    body{{font-family:'DM Sans',sans-serif;background:#f0f4ff;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}}
+    .card{{background:white;border-radius:24px;padding:40px;max-width:480px;width:100%;box-shadow:0 8px 40px rgba(0,0,0,0.08)}}
+    .logo{{font-size:2.5rem;margin-bottom:16px}}
+    .badge{{display:inline-block;background:#eff4ff;color:#2563eb;border:1px solid #c7d2fe;border-radius:100px;padding:4px 12px;font-size:0.75rem;font-weight:600;margin-bottom:20px}}
+    h1{{font-family:'DM Serif Display',serif;font-size:1.6rem;color:#0f1117;margin-bottom:8px;line-height:1.2}}
+    .meta{{color:#6b7280;font-size:0.9rem;margin-bottom:28px}}
+    .event-box{{background:#f8faff;border:1px solid #e0e7ff;border-radius:14px;padding:20px;margin-bottom:24px}}
+    .event-title{{font-weight:600;font-size:1.05rem;color:#0f1117;margin-bottom:6px}}
+    .event-time{{color:#4b5563;font-size:0.875rem}}
+    .btn{{display:block;width:100%;padding:14px;border-radius:12px;font-size:1rem;font-weight:500;text-align:center;text-decoration:none;cursor:pointer;border:none;transition:all 0.2s;margin-bottom:10px}}
+    .btn-accept{{background:#2563eb;color:white;box-shadow:0 4px 12px rgba(37,99,235,0.25)}}
+    .btn-accept:hover{{background:#1d4ed8}}
+    .btn-counter{{background:white;color:#2563eb;border:1px solid #c7d2fe}}
+    .btn-counter:hover{{background:#eff4ff}}
+    .btn-decline{{background:white;color:#6b7280;border:1px solid #e5e7eb;font-size:0.875rem}}
+    .counter-form{{display:none;margin-top:16px;padding:16px;background:#f9fafb;border-radius:12px;border:1px solid #e5e7eb}}
+    .counter-form.show{{display:block}}
+    label{{font-size:0.825rem;font-weight:500;color:#374151;display:block;margin-bottom:4px}}
+    input{{width:100%;padding:10px 12px;border:1px solid #d1d5db;border-radius:8px;font-size:0.9rem;margin-bottom:12px;font-family:inherit}}
+    .powered{{text-align:center;font-size:0.75rem;color:#9ca3af;margin-top:20px}}
+  </style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">📅</div>
+  <div class="badge">CalendarBot Invite</div>
+  <h1>You've been invited!</h1>
+  <p class="meta">Someone wants to meet with you.</p>
+
+  <div class="event-box">
+    <div class="event-title">📌 {title}</div>
+    <div class="event-time">🗓 {date_str} {time_str}</div>
+  </div>
+
+  <a href="{auth_url}" class="btn btn-accept">✅ Accept &amp; Add to Google Calendar</a>
+  <button class="btn btn-counter" onclick="document.getElementById('cf').classList.toggle('show')">💬 Suggest a different time</button>
+
+  <form class="counter-form" id="cf" action="/invite/counter/{token}" method="GET">
+    <label>Your name</label>
+    <input name="name" placeholder="e.g. Sarah" required/>
+    <label>Suggest a date</label>
+    <input name="date" type="date" required/>
+    <label>Suggest a time</label>
+    <input name="time" type="time" required/>
+    <button type="submit" class="btn btn-accept" style="margin-bottom:0">Send Counter Proposal</button>
+  </form>
+
+  <a href="/invite/decline/{token}" class="btn btn-decline" style="margin-top:8px">✕ Decline</a>
+
+  <div class="powered">Powered by CalendarBot</div>
+</div>
+</body>
+</html>"""
+
+def _simple_page(emoji, heading, body):
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>CalendarBot</title>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500&display=swap" rel="stylesheet"/>
+  <style>
+    body{{font-family:'DM Sans',sans-serif;background:#f0f4ff;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}}
+    .card{{background:white;border-radius:24px;padding:48px 40px;max-width:420px;width:100%;box-shadow:0 8px 40px rgba(0,0,0,0.08);text-align:center}}
+    .icon{{font-size:3rem;margin-bottom:16px}}
+    h2{{font-size:1.4rem;color:#0f1117;margin-bottom:8px}}
+    p{{color:#6b7280;font-size:0.9rem;line-height:1.6}}
+  </style>
+</head>
+<body>
+<div class="card">
+  <div class="icon">{emoji}</div>
+  <h2>{heading}</h2>
+  <p>{body}</p>
+</div>
+</body>
+</html>"""
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -609,6 +802,141 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "2")
             self.end_headers()
             self.wfile.write(b"OK")
+            return
+
+        # ── Invite: show accept/decline/counter page ──────────────────────────
+        if parsed.path.startswith("/invite/") and not any(
+            parsed.path.startswith(f"/invite/{x}") for x in ["callback", "counter", "decline"]
+        ):
+            token = parsed.path.split("/invite/")[-1].strip("/")
+            invite = get_invite(token)
+            if not invite or invite["status"] != "pending":
+                self._html(404, _simple_page("❌", "Invite not found",
+                    "This invite link has already been used or doesn't exist."))
+                return
+            ev = json.loads(invite["event_data"])
+            auth_url = make_invite_auth_url(token)
+            time_str = f"at {ev['start_time']}" if ev.get("start_time") else "(all day)"
+            page = _invite_page(
+                title=ev.get("title", "Meeting"),
+                date_str=ev.get("date", ""),
+                time_str=time_str,
+                invitee_name=ev.get("invitee_name", "You"),
+                token=token,
+                auth_url=auth_url,
+            )
+            self._html(200, page)
+            return
+
+        # ── Invite: OAuth callback after invitee connects Google ──────────────
+        if parsed.path == "/invite/callback":
+            params = parse_qs(parsed.query)
+            token = params.get("state", [None])[0]
+            code  = params.get("code",  [None])[0]
+            if not token or not code:
+                self._html(400, _simple_page("❌", "Invalid request", "Something went wrong. Please try the link again."))
+                return
+            invite = get_invite(token)
+            if not invite:
+                self._html(404, _simple_page("❌", "Invite expired", "This invite link has already been used."))
+                return
+            if token not in pending_invite_flows:
+                self._html(400, _simple_page("⏱", "Session expired",
+                    "Your session expired. Please go back and click Accept again."))
+                return
+            try:
+                flow = pending_invite_flows.pop(token)
+                flow.fetch_token(code=code)
+                creds = flow.credentials
+                service = build("calendar", "v3", credentials=creds)
+                ev = json.loads(invite["event_data"])
+                add_event(service, ev)
+                update_invite(token, "accepted")
+
+                # Notify organiser
+                organiser_id = invite["organiser_telegram_id"]
+                invitee_name = invite.get("invitee_name") or "Someone"
+                ev_title = ev.get("title", "your event")
+                ev_date  = ev.get("date", "")
+                ev_time  = f" at {ev['start_time']}" if ev.get("start_time") else ""
+                if telegram_app:
+                    import asyncio
+                    asyncio.run_coroutine_threadsafe(
+                        telegram_app.bot.send_message(
+                            chat_id=organiser_id,
+                            text=f"🎉 *{invitee_name} accepted your invite!*\n\n"
+                                 f"• *{ev_title}* — {ev_date}{ev_time}\n\n"
+                                 f"The event has been added to their Google Calendar.",
+                            parse_mode="Markdown"),
+                        telegram_app.update_queue._loop
+                            if hasattr(telegram_app.update_queue, "_loop")
+                            else asyncio.new_event_loop()
+                    )
+                self._html(200, _simple_page("🎉", "You're in!",
+                    f"<strong>{ev.get('title','The event')}</strong> has been added to your Google Calendar.<br><br>The organiser has been notified."))
+            except Exception as e:
+                logger.exception("Invite callback error")
+                self._html(500, _simple_page("❌", "Something went wrong", str(e)))
+            return
+
+        # ── Invite: counter-propose ───────────────────────────────────────────
+        if parsed.path.startswith("/invite/counter/"):
+            token = parsed.path.split("/invite/counter/")[-1].strip("/")
+            params = parse_qs(parsed.query)
+            counter_date = params.get("date", [None])[0]
+            counter_time = params.get("time", [None])[0]
+            name         = params.get("name", ["Someone"])[0]
+            invite = get_invite(token)
+            if not invite:
+                self._html(404, _simple_page("❌", "Invite not found", "This invite link has expired."))
+                return
+            update_invite(token, "countered",
+                counter_time=counter_time, counter_date=counter_date, invitee_name=name)
+            ev = json.loads(invite["event_data"])
+            organiser_id = invite["organiser_telegram_id"]
+            if telegram_app:
+                import asyncio
+                asyncio.run_coroutine_threadsafe(
+                    telegram_app.bot.send_message(
+                        chat_id=organiser_id,
+                        text=f"💬 *{name} suggested a different time*\n\n"
+                             f"• Original: *{ev.get('title')}* — {ev.get('date','')} {ev.get('start_time','')}\n"
+                             f"• Suggested: *{counter_date}* at *{counter_time}*\n\n"
+                             f"Reply to this message or update the event manually.",
+                        parse_mode="Markdown"),
+                    telegram_app.update_queue._loop
+                        if hasattr(telegram_app.update_queue, "_loop")
+                        else asyncio.new_event_loop()
+                )
+            self._html(200, _simple_page("💬", "Counter proposal sent!",
+                f"Your suggestion ({counter_date} at {counter_time}) has been sent to the organiser."))
+            return
+
+        # ── Invite: decline ───────────────────────────────────────────────────
+        if parsed.path.startswith("/invite/decline/"):
+            token = parsed.path.split("/invite/decline/")[-1].strip("/")
+            invite = get_invite(token)
+            if not invite:
+                self._html(404, _simple_page("❌", "Invite not found", "This invite link has expired."))
+                return
+            update_invite(token, "declined")
+            ev = json.loads(invite["event_data"])
+            organiser_id = invite["organiser_telegram_id"]
+            if telegram_app:
+                import asyncio
+                asyncio.run_coroutine_threadsafe(
+                    telegram_app.bot.send_message(
+                        chat_id=organiser_id,
+                        text=f"❌ *Someone declined your invite*\n\n"
+                             f"• *{ev.get('title')}* — {ev.get('date','')}\n\n"
+                             f"You can send them a new invite or adjust the event.",
+                        parse_mode="Markdown"),
+                    telegram_app.update_queue._loop
+                        if hasattr(telegram_app.update_queue, "_loop")
+                        else asyncio.new_event_loop()
+                )
+            self._html(200, _simple_page("👋", "Declined",
+                "You've declined the invite. The organiser has been notified."))
             return
 
         if parsed.path == "/oauth/callback":
