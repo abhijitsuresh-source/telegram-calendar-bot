@@ -68,8 +68,9 @@ Today is {today}.
 
 Resolve relative dates carefully:
 - "tomorrow" = today + 1 day
-- "next Monday" = the NEXT Monday that has not happened yet
+- "next Monday" = the NEXT Monday that has not yet happened
 - "this Friday" = the coming Friday this week
+- A bare day name with no qualifier (e.g. "Friday", "schedule for Friday", "Monday meeting") = the NEXT occurrence of that day that has not yet happened — NEVER today even if today is that day
 - Always calculate exact dates based on today
 
 Return ONLY a valid JSON array (no markdown, no explanation). Each object must have:
@@ -130,6 +131,11 @@ Extract the invite details and return ONLY a valid JSON object (no markdown):
 - "end_time": HH:MM 24h or null (default 1 hour after start_time)
 - "all_day": true or false
 - "description": any extra context (string, can be "")
+
+Resolve relative dates carefully:
+- "tomorrow" = today + 1 day
+- "next Monday" = the NEXT Monday that has not yet happened
+- A bare day name with no qualifier (e.g. "Friday", "this Friday") = the NEXT occurrence of that day that has not yet happened — NEVER today even if today is that day
 
 Time hints: dinner=19:00, lunch=12:30, morning=09:00, EOD=17:00
 """
@@ -368,7 +374,7 @@ def make_invite_auth_url(token: str) -> str:
     pending_invite_flows[token] = flow
     return auth_url
 
-def add_event(service, ev: dict) -> str:
+def add_event(service, ev: dict, with_name: str = None) -> str:
     date_str   = ev["date"]
     start_time = ev.get("start_time")
     end_time   = ev.get("end_time")
@@ -378,8 +384,14 @@ def add_event(service, ev: dict) -> str:
         {"method": "popup", "minutes": 5},
     ]}
 
+    base_description = ev.get("description", "")
+    if with_name:
+        description = f"With: {with_name}" + (f"\n\n{base_description}" if base_description else "")
+    else:
+        description = base_description
+
     if all_day:
-        body = {"summary": ev["title"], "description": ev.get("description", ""),
+        body = {"summary": ev["title"], "description": description,
                 "start": {"date": date_str}, "end": {"date": date_str}, "reminders": reminder}
     else:
         if end_time:
@@ -387,7 +399,7 @@ def add_event(service, ev: dict) -> str:
         else:
             sh, sm = map(int, start_time.split(":"))
             end_dt = f"{date_str}T{(sh+1)%24:02d}:{sm:02d}:00"
-        body = {"summary": ev["title"], "description": ev.get("description", ""),
+        body = {"summary": ev["title"], "description": description,
                 "start": {"dateTime": f"{date_str}T{start_time}:00", "timeZone": TIMEZONE},
                 "end":   {"dateTime": end_dt, "timeZone": TIMEZONE},
                 "reminders": reminder}
@@ -402,8 +414,10 @@ def add_event(service, ev: dict) -> str:
     return r.get("htmlLink", "")
 
 def get_upcoming_events(service, days: int = 7) -> list:
-    now = datetime.utcnow().isoformat() + "Z"
-    later = (datetime.utcnow() + timedelta(days=days)).isoformat() + "Z"
+    import zoneinfo
+    tz = zoneinfo.ZoneInfo(TIMEZONE)
+    now = datetime.now(tz).isoformat()
+    later = (datetime.now(tz) + timedelta(days=days)).isoformat()
     result = service.events().list(
         calendarId=GOOGLE_CALENDAR_ID, timeMin=now, timeMax=later,
         maxResults=5, singleEvents=True, orderBy="startTime").execute()
@@ -429,6 +443,8 @@ async def handle_invite(update: Update, text: str, telegram_id: int):
     try:
         invite_data = parse_invite(text)
         invitee_name = invite_data.get("invitee_name", "Someone")
+        organiser_name = update.effective_user.first_name or "Organiser"
+        invite_data["organiser_name"] = organiser_name
 
         # Store invite — event is only added to both calendars after invitee accepts
         token = create_invite(telegram_id, invite_data, "")
@@ -945,9 +961,12 @@ class Handler(BaseHTTPRequestHandler):
                 invitee_creds = flow.credentials
                 invitee_service = build("calendar", "v3", credentials=invitee_creds)
                 ev = json.loads(invite["event_data"])
+                organiser_id = invite["organiser_telegram_id"]
+                invitee_name = invite.get("invitee_name") or "Someone"
+                organiser_name = ev.get("organiser_name") or "Organiser"
 
-                # Add event to invitee's calendar
-                add_event(invitee_service, ev)
+                # Add event to invitee's calendar — show organiser's name
+                add_event(invitee_service, ev, with_name=organiser_name)
 
                 # Immediately revoke invitee's Google access — we don't need it anymore
                 try:
@@ -963,11 +982,10 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as e:
                     logger.warning(f"Invitee token revoke failed: {e}")
 
-                # Add event to organiser's calendar
-                organiser_id = invite["organiser_telegram_id"]
+                # Add event to organiser's calendar — show invitee's name
                 organiser_service = get_calendar_service(organiser_id)
                 if organiser_service:
-                    organiser_link = add_event(organiser_service, ev)
+                    organiser_link = add_event(organiser_service, ev, with_name=invitee_name)
                     supabase.table("invites").update({"event_link": organiser_link}).eq("token", token).execute()
                 else:
                     logger.warning(f"Organiser {organiser_id} no longer connected — could not add event to their calendar")
