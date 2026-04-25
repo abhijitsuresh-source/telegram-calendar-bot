@@ -540,10 +540,18 @@ async def handle_list(update: Update, telegram_id: int):
         return
 
     lines = ["📅 *Your next events:*\n"]
+    import zoneinfo
+    tz = zoneinfo.ZoneInfo(TIMEZONE)
     for ev in events:
         start = ev.get("start", {}).get("dateTime", ev.get("start", {}).get("date", ""))
         title = ev.get("summary", "Untitled")
-        time_display = start[:16].replace("T", " at ") if "T" in start else start
+        if "T" in start:
+            # Parse the ISO datetime (handles both +05:30 and Z suffixes) and convert to local tz
+            from datetime import timezone
+            dt = datetime.fromisoformat(start.replace("Z", "+00:00")).astimezone(tz)
+            time_display = dt.strftime("%Y-%m-%d at %H:%M")
+        else:
+            time_display = start  # all-day event, just show the date
         lines.append(f"• *{title}* — {time_display}")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
