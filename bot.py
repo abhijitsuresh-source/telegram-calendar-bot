@@ -36,6 +36,152 @@ SCOPES            = ["https://www.googleapis.com/auth/calendar.events"]
 groq_client = Groq(api_key=GROQ_API_KEY)
 supabase    = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# ── Optional env vars ─────────────────────────────────────────────────────────
+RAZORPAY_KEY_ID      = os.environ.get("RAZORPAY_KEY_ID", "")
+RAZORPAY_KEY_SECRET  = os.environ.get("RAZORPAY_KEY_SECRET", "")
+RAZORPAY_BILLING_ENABLED = bool(RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET)
+
+if RAZORPAY_BILLING_ENABLED:
+    from razorpay_billing import (
+        create_or_get_customer, create_subscription,
+        cancel_subscription, verify_webhook_signature, parse_webhook, PLANS,
+    )
+
+# ── Rate limiting config ──────────────────────────────────────────────────────
+RATE_LIMIT_MESSAGES  = 30   # max messages per window
+RATE_LIMIT_WINDOW    = 60   # seconds
+
+# ── Subscription helpers ──────────────────────────────────────────────────────
+
+def get_subscription(telegram_id: int) -> dict | None:
+    """Return the subscription row for a user, or None."""
+    try:
+        r = supabase.table("subscriptions").select("*").eq("telegram_id", telegram_id).execute()
+        return r.data[0] if r.data else None
+    except Exception:
+        return None
+
+def ensure_trial(telegram_id: int):
+    """Create a trial subscription row if one doesn't exist yet."""
+    from datetime import timezone
+    existing = get_subscription(telegram_id)
+    if not existing:
+        from datetime import datetime, timedelta
+        now = datetime.now(timezone.utc)
+        supabase.table("subscriptions").insert({
+            "telegram_id":    telegram_id,
+            "plan":           "free",
+            "status":         "trial",
+            "trial_started_at": now.isoformat(),
+            "trial_ends_at":  (now + timedelta(days=7)).isoformat(),
+        }).execute()
+
+def is_subscribed(telegram_id: int) -> tuple[bool, str]:
+    """
+    Returns (allowed, reason).
+    allowed=True  → user may use the bot.
+    allowed=False → reason explains why not.
+    """
+    if not RAZORPAY_BILLING_ENABLED:
+        return True, "billing_disabled"
+
+    ensure_trial(telegram_id)
+    sub = get_subscription(telegram_id)
+    if not sub:
+        return False, "no_subscription"
+
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    status = sub.get("status", "trial")
+
+    if status == "active":
+        return True, "active"
+
+    if status == "trial":
+        trial_ends = sub.get("trial_ends_at")
+        if trial_ends:
+            # Parse ISO string — handle both Z and +00:00
+            te = datetime.fromisoformat(trial_ends.replace("Z", "+00:00"))
+            if now < te:
+                days_left = (te - now).days
+                return True, f"trial:{days_left}"
+        return False, "trial_expired"
+
+    return False, status  # cancelled / expired
+
+def activate_subscription(telegram_id: int, razorpay_sub_id: str, plan: str):
+    """Called from webhook when payment succeeds."""
+    from datetime import datetime, timezone
+    existing = get_subscription(telegram_id)
+    now = datetime.now(timezone.utc).isoformat()
+    if existing:
+        supabase.table("subscriptions").update({
+            "status":           "active",
+            "plan":             plan,
+            "razorpay_sub_id":  razorpay_sub_id,
+            "subscribed_at":    now,
+            "cancelled_at":     None,
+        }).eq("telegram_id", telegram_id).execute()
+    else:
+        supabase.table("subscriptions").insert({
+            "telegram_id":      telegram_id,
+            "status":           "active",
+            "plan":             plan,
+            "razorpay_sub_id":  razorpay_sub_id,
+            "subscribed_at":    now,
+        }).execute()
+
+def deactivate_subscription(telegram_id: int):
+    """Called from webhook when subscription is cancelled/expired."""
+    from datetime import datetime, timezone
+    supabase.table("subscriptions").update({
+        "status":       "cancelled",
+        "cancelled_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("telegram_id", telegram_id).execute()
+
+# ── Rate limiter ──────────────────────────────────────────────────────────────
+
+def check_rate_limit(telegram_id: int) -> bool:
+    """
+    Returns True if the user is within rate limits, False if exceeded.
+    Uses a sliding window stored in Supabase.
+    """
+    try:
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        r = supabase.table("rate_limits").select("*").eq("telegram_id", telegram_id).execute()
+
+        if not r.data:
+            supabase.table("rate_limits").insert({
+                "telegram_id":   telegram_id,
+                "message_count": 1,
+                "window_start":  now.isoformat(),
+            }).execute()
+            return True
+
+        row = r.data[0]
+        window_start = datetime.fromisoformat(row["window_start"].replace("Z", "+00:00"))
+        count        = row["message_count"]
+
+        # Reset window if expired
+        if (now - window_start).total_seconds() > RATE_LIMIT_WINDOW:
+            supabase.table("rate_limits").update({
+                "message_count": 1,
+                "window_start":  now.isoformat(),
+            }).eq("telegram_id", telegram_id).execute()
+            return True
+
+        if count >= RATE_LIMIT_MESSAGES:
+            return False
+
+        supabase.table("rate_limits").update({
+            "message_count": count + 1,
+        }).eq("telegram_id", telegram_id).execute()
+        return True
+    except Exception as e:
+        logger.warning(f"Rate limit check failed for {telegram_id}: {e}")
+        return True  # fail open — don't block users on DB errors
+
 # ── Token encryption (AES-256 + PBKDF2 key derivation) ───────────────────────
 from cryptography.fernet import Fernet
 import base64 as _b64enc, hashlib as _hs
@@ -702,7 +848,23 @@ First, connect your Google Calendar below 👇"""
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tid = update.effective_user.id
+    ensure_trial(tid)
+    allowed, reason = is_subscribed(tid)
     creds = get_user_creds(tid)
+
+    # Build subscription status line
+    if reason == "billing_disabled":
+        sub_line = ""
+    elif reason == "active":
+        sub_line = "\n✅ *Subscription active*"
+    elif reason.startswith("trial:"):
+        days = reason.split(":")[1]
+        sub_line = f"\n⏳ *Free trial — {days} day(s) left* · /subscribe to continue"
+    elif reason == "trial_expired":
+        sub_line = "\n🔒 *Trial expired* · Use /subscribe to unlock"
+    else:
+        sub_line = "\n🔒 *Subscription inactive* · Use /subscribe to reactivate"
+
     if creds:
         await update.message.reply_text(
             "👋 *Welcome back!*\n\n"
@@ -712,17 +874,131 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• _Team standup every Monday 10am_\n"
             "• _Change my dentist to 4pm_\n"
             "• _Show my upcoming events_\n"
-            "• _Disconnect my Google account_",
+            "• _Disconnect my Google account_" + sub_line,
             parse_mode="Markdown")
     else:
         auth_url = make_auth_url(tid)
         await update.message.reply_text(
-            WELCOME_MESSAGE + f"\n\n[👉 Connect Google Calendar]({auth_url})",
+            WELCOME_MESSAGE + f"\n\n[👉 Connect Google Calendar]({auth_url})" + sub_line,
             parse_mode="Markdown")
+
+async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show subscription plans and payment links."""
+    tid  = update.effective_user.id
+    args = context.args  # e.g. /subscribe pro
+
+    if not RAZORPAY_BILLING_ENABLED:
+        await update.message.reply_text("💳 Billing is not configured yet. Check back soon!")
+        return
+
+    # Check if already active
+    allowed, reason = is_subscribed(tid)
+    if reason == "active":
+        await update.message.reply_text(
+            "✅ You already have an active subscription!\n\n"
+            "Use /cancel to cancel at end of billing cycle.",
+            parse_mode="Markdown")
+        return
+
+    plan = (args[0].lower() if args else None)
+    if plan not in PLANS:
+        # Show plan picker
+        plan_lines = []
+        for key, p in PLANS.items():
+            features = " · ".join(p["features"])
+            plan_lines.append(f"*{p['label']}* — ₹{p['price']}/month\n_{features}_\n👉 /subscribe {key}")
+        await update.message.reply_text(
+            "💳 *Choose a plan:*\n\n" + "\n\n".join(plan_lines),
+            parse_mode="Markdown")
+        return
+
+    await update.message.reply_text("⏳ Generating your payment link…")
+    customer_id = create_or_get_customer(tid)
+    sub_id, payment_url = create_subscription(plan, customer_id, tid)
+
+    if not payment_url:
+        await update.message.reply_text(
+            "❌ Could not create payment link. Please try again or contact support.")
+        return
+
+    plan_config = PLANS[plan]
+    await update.message.reply_text(
+        f"💳 *{plan_config['label']} Plan — ₹{plan_config['price']}/month*\n\n"
+        f"Click the link below to complete payment.\n"
+        f"Your bot access will activate instantly after payment.\n\n"
+        f"[👉 Pay ₹{plan_config['price']} via Razorpay]({payment_url})\n\n"
+        f"_Link expires in 15 minutes._",
+        parse_mode="Markdown",
+        disable_web_page_preview=True)
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel subscription at end of billing cycle."""
+    tid = update.effective_user.id
+
+    if not RAZORPAY_BILLING_ENABLED:
+        await update.message.reply_text("Billing is not configured.")
+        return
+
+    sub = get_subscription(tid)
+    if not sub or sub.get("status") != "active":
+        await update.message.reply_text("You don't have an active subscription to cancel.")
+        return
+
+    razorpay_sub_id = sub.get("razorpay_sub_id")
+    if razorpay_sub_id:
+        success = cancel_subscription(razorpay_sub_id)
+        if success:
+            await update.message.reply_text(
+                "✅ Your subscription has been cancelled and will not renew.\n\n"
+                "You can continue using the bot until the end of your current billing period.",
+                parse_mode="Markdown")
+        else:
+            await update.message.reply_text(
+                "❌ Could not cancel via Razorpay. Please contact support.")
+    else:
+        deactivate_subscription(tid)
+        await update.message.reply_text("Your subscription has been cancelled.")
+
+async def _check_access(update: Update) -> bool:
+    """
+    Returns True if user is allowed to proceed.
+    Sends a message and returns False if not.
+    """
+    tid = update.effective_user.id
+
+    # Rate limit check
+    if not check_rate_limit(tid):
+        await update.message.reply_text(
+            "⚠️ You're sending messages too fast. Please slow down a little.")
+        return False
+
+    # Subscription check
+    allowed, reason = is_subscribed(tid)
+    if not allowed:
+        if reason == "trial_expired":
+            await update.message.reply_text(
+                "⏳ *Your free trial has ended.*\n\n"
+                "Subscribe to continue using CalendarBot:\n\n"
+                "👉 /subscribe",
+                parse_mode="Markdown")
+        elif reason in ("cancelled", "expired"):
+            await update.message.reply_text(
+                "🔒 *Your subscription is inactive.*\n\n"
+                "Reactivate it with /subscribe",
+                parse_mode="Markdown")
+        else:
+            await update.message.reply_text(
+                "🔒 *Access restricted.*\n\nUse /subscribe to get started.",
+                parse_mode="Markdown")
+        return False
+    return True
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tid = update.effective_user.id
     text = update.message.text
+
+    if not await _check_access(update):
+        return
 
     intent = detect_intent(text)
     logger.info(f"Intent: {intent} for: {text[:50]}")
@@ -767,6 +1043,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tid = update.effective_user.id
+    if not await _check_access(update):
+        return
     photo = update.message.photo[-1]
     async def ext():
         data = await download(context.bot, photo.file_id)
@@ -775,6 +1053,8 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tid = update.effective_user.id
+    if not await _check_access(update):
+        return
     doc = update.message.document
     mime = doc.mime_type or ""
     async def ext():
@@ -786,6 +1066,8 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tid = update.effective_user.id
+    if not await _check_access(update):
+        return
     voice = update.message.voice or update.message.audio
 
     # For voice, first detect intent from transcription
@@ -922,7 +1204,14 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(b"OK")
             return
 
-        # ── Invite: show accept/decline/counter page ──────────────────────────
+        # ── Payment success redirect ──────────────────────────────────────────
+        if parsed.path == "/payment/success":
+            self._html(200, _simple_page(
+                "🎉", "Payment Successful!",
+                "Your CalendarBot subscription is now active.<br><br>"
+                "<strong>Go back to Telegram</strong> and start using the bot!"))
+            return
+
         if parsed.path.startswith("/invite/") and not any(
             parsed.path.startswith(f"/invite/{x}") for x in ["callback", "counter", "decline"]
         ):
@@ -1123,6 +1412,75 @@ class Handler(BaseHTTPRequestHandler):
 
         self._html(200, "<h2>CalendarBot is running!</h2>")
 
+    def do_POST(self):
+        """Handle Razorpay webhook POST requests."""
+        parsed = urlparse(self.path)
+        if parsed.path != "/razorpay/webhook":
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body   = self.rfile.read(length)
+            sig    = self.headers.get("X-Razorpay-Signature", "")
+
+            if RAZORPAY_BILLING_ENABLED:
+                if not verify_webhook_signature(body, sig):
+                    logger.warning("Razorpay webhook: invalid signature")
+                    self.send_response(400)
+                    self.end_headers()
+                    return
+
+                event = parse_webhook(body)
+                ev_type     = event.get("event", "")
+                telegram_id = event.get("telegram_id")
+                sub_id      = event.get("subscription_id")
+                plan        = event.get("plan", "basic")
+
+                logger.info(f"Razorpay webhook: {ev_type} tid={telegram_id} sub={sub_id}")
+
+                if telegram_id:
+                    if ev_type == "subscription.activated":
+                        activate_subscription(telegram_id, sub_id, plan)
+                        if telegram_app:
+                            import asyncio
+                            asyncio.run_coroutine_threadsafe(
+                                telegram_app.bot.send_message(
+                                    chat_id=telegram_id,
+                                    text="🎉 *Subscription activated!*\n\nYou now have full access to CalendarBot. "
+                                         "Just send a message to add events to your calendar!",
+                                    parse_mode="Markdown"),
+                                telegram_app.update_queue._loop
+                                    if hasattr(telegram_app.update_queue, "_loop")
+                                    else asyncio.new_event_loop()
+                            )
+
+                    elif ev_type in ("subscription.cancelled", "subscription.expired",
+                                     "subscription.completed"):
+                        deactivate_subscription(telegram_id)
+                        if telegram_app:
+                            import asyncio
+                            asyncio.run_coroutine_threadsafe(
+                                telegram_app.bot.send_message(
+                                    chat_id=telegram_id,
+                                    text="ℹ️ Your CalendarBot subscription has ended. "
+                                         "Use /subscribe to reactivate.",
+                                    parse_mode="Markdown"),
+                                telegram_app.update_queue._loop
+                                    if hasattr(telegram_app.update_queue, "_loop")
+                                    else asyncio.new_event_loop()
+                            )
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"status":"ok"}')
+        except Exception as e:
+            logger.exception(f"Webhook handler error: {e}")
+            self.send_response(500)
+            self.end_headers()
+
     def _html(self, code, body):
         # If body is already a full HTML page, send it as-is
         if body.lstrip().startswith("<!DOCTYPE") or body.lstrip().startswith("<html"):
@@ -1146,6 +1504,8 @@ def main():
 
     telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
     telegram_app.add_handler(CommandHandler("start", cmd_start))
+    telegram_app.add_handler(CommandHandler("subscribe", cmd_subscribe))
+    telegram_app.add_handler(CommandHandler("cancel", cmd_cancel))
     telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     telegram_app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     telegram_app.add_handler(MessageHandler(filters.Document.ALL, on_document))
