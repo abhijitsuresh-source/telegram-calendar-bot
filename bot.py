@@ -186,24 +186,45 @@ def check_rate_limit(telegram_id: int) -> bool:
 from cryptography.fernet import Fernet
 import base64 as _b64enc, hashlib as _hs
 
-# Salt is fixed (public) — security comes from PBKDF2 iteration count.
-# To rotate the key: change TOKEN_ENCRYPT_KEY and re-encrypt all rows in Supabase.
-_PBKDF2_SALT       = b"calendarbot-v1"
+# Per-token random salt (16 bytes) stored alongside the ciphertext.
+# Format on disk: base64(salt) + ":" + base64(fernet_token)
+# Legacy single-salt format is still readable for backwards compat.
 _PBKDF2_ITERATIONS = 260_000          # OWASP 2023 recommendation for SHA-256
+_LEGACY_SALT       = b"calendarbot-v1"  # only used to decrypt old tokens
 
-def _fernet():
+import secrets as _secrets
+
+def _make_fernet(salt: bytes) -> Fernet:
+    """Derive a Fernet key from TOKEN_ENCRYPT_KEY + the given salt."""
     raw = os.environ.get("TOKEN_ENCRYPT_KEY", "")
     if not raw:
         raise ValueError("TOKEN_ENCRYPT_KEY env var not set")
-    dk  = _hs.pbkdf2_hmac("sha256", raw.encode(), _PBKDF2_SALT, _PBKDF2_ITERATIONS, dklen=32)
+    dk  = _hs.pbkdf2_hmac("sha256", raw.encode(), salt, _PBKDF2_ITERATIONS, dklen=32)
     key = _b64enc.urlsafe_b64encode(dk)
     return Fernet(key)
 
 def encrypt_token(data: str) -> str:
-    return _fernet().encrypt(data.encode()).decode()
+    """
+    Encrypt with a fresh random 16-byte salt per token.
+    Stored format: <base64_salt>:<fernet_token>
+    """
+    salt = _secrets.token_bytes(16)
+    token = _make_fernet(salt).encrypt(data.encode()).decode()
+    return _b64enc.urlsafe_b64encode(salt).decode() + ":" + token
 
 def decrypt_token(data: str) -> str:
-    return _fernet().decrypt(data.encode()).decode()
+    """
+    Decrypt. Handles both:
+      - New format: <base64_salt>:<fernet_token>
+      - Legacy format: raw fernet token (uses old fixed salt)
+    """
+    if ":" in data:
+        salt_b64, token = data.split(":", 1)
+        salt = _b64enc.urlsafe_b64decode(salt_b64 + "==")
+        return _make_fernet(salt).decrypt(token.encode()).decode()
+    else:
+        # Legacy: fixed salt — still readable, will be re-encrypted on next save
+        return _make_fernet(_LEGACY_SALT).decrypt(data.encode()).decode()
 
 
 # ── Prompts ────────────────────────────────────────────────────────────────────
@@ -493,8 +514,43 @@ def get_calendar_service(telegram_id: int):
     return build("calendar", "v3", credentials=creds)
 
 # ── OAuth ──────────────────────────────────────────────────────────────────────
+# OAuth flows stored in Supabase instead of memory
+# so server restarts don't break mid-auth users
+import pickle as _pickle
+
+def _save_oauth_flow(key: str, flow, is_invite: bool = False):
+    """Persist OAuth flow to Supabase (serialised + encrypted)."""
+    try:
+        raw = _pickle.dumps(flow)
+        encrypted = encrypt_token(_b64enc.urlsafe_b64encode(raw).decode())
+        table = "oauth_flows"
+        supabase.table(table).upsert({
+            "key":        key,
+            "flow_data":  encrypted,
+            "is_invite":  is_invite,
+            "created_at": datetime.utcnow().isoformat(),
+        }).execute()
+    except Exception as e:
+        logger.error(f"Failed to save OAuth flow: {e}")
+
+def _load_oauth_flow(key: str):
+    """Load and delete OAuth flow from Supabase."""
+    try:
+        r = supabase.table("oauth_flows").select("flow_data").eq("key", key).execute()
+        if not r.data:
+            return None
+        encrypted = r.data[0]["flow_data"]
+        raw = _b64enc.urlsafe_b64decode(decrypt_token(encrypted) + "==")
+        flow = _pickle.loads(raw)
+        supabase.table("oauth_flows").delete().eq("key", key).execute()
+        return flow
+    except Exception as e:
+        logger.error(f"Failed to load OAuth flow: {e}")
+        return None
+
+# Fallback in-memory store (used if Supabase is unavailable)
 pending_flows = {}
-pending_invite_flows = {}  # token -> flow (for invitee OAuth)
+pending_invite_flows = {}
 
 def make_auth_url(telegram_id: int) -> str:
     flow = Flow.from_client_secrets_file(
@@ -505,7 +561,8 @@ def make_auth_url(telegram_id: int) -> str:
         include_granted_scopes="true",
         prompt="select_account consent",
         state=str(telegram_id))
-    pending_flows[str(telegram_id)] = flow
+    _save_oauth_flow(str(telegram_id), flow, is_invite=False)
+    pending_flows[str(telegram_id)] = flow  # fallback
     return auth_url
 
 # ── Calendar helpers ───────────────────────────────────────────────────────────
@@ -517,7 +574,8 @@ def make_invite_auth_url(token: str) -> str:
         access_type="offline",
         prompt="select_account consent",
         state=token)
-    pending_invite_flows[token] = flow
+    _save_oauth_flow(token, flow, is_invite=True)
+    pending_invite_flows[token] = flow  # fallback
     return auth_url
 
 def add_event(service, ev: dict, with_name: str = None) -> str:
@@ -1248,12 +1306,14 @@ class Handler(BaseHTTPRequestHandler):
             if not valid:
                 self._html(404, _simple_page("❌", "Invite not available", reason))
                 return
-            if token not in pending_invite_flows:
+            # Load from Supabase first, fall back to memory
+            flow = _load_oauth_flow(token) or pending_invite_flows.pop(token, None)
+            if not flow:
                 self._html(400, _simple_page("⏱", "Session expired",
                     "Your session expired. Please go back and click Accept again."))
                 return
             try:
-                flow = pending_invite_flows.pop(token)
+                pass  # flow already loaded above
                 flow.fetch_token(code=code)
                 invitee_creds = flow.credentials
                 invitee_service = build("calendar", "v3", credentials=invitee_creds)
@@ -1317,10 +1377,31 @@ class Handler(BaseHTTPRequestHandler):
         # ── Invite: counter-propose ───────────────────────────────────────────
         if parsed.path.startswith("/invite/counter/"):
             token = parsed.path.split("/invite/counter/")[-1].strip("/")
+
+            # Validate token format (only allow URL-safe base64 chars)
+            if not re.match(r'^[A-Za-z0-9_-]{10,40}$', token):
+                self._html(400, _simple_page("❌", "Invalid request", "Bad token format."))
+                return
+
             params = parse_qs(parsed.query)
-            counter_date = params.get("date", [None])[0]
-            counter_time = params.get("time", [None])[0]
-            name         = params.get("name", ["Someone"])[0]
+            counter_date_raw = params.get("date", [None])[0]
+            counter_time_raw = params.get("time", [None])[0]
+            name_raw         = params.get("name", ["Someone"])[0]
+
+            # Validate date format: YYYY-MM-DD
+            if not counter_date_raw or not re.match(r'^\d{4}-\d{2}-\d{2}$', counter_date_raw):
+                self._html(400, _simple_page("❌", "Invalid date", "Please use YYYY-MM-DD format."))
+                return
+
+            # Validate time format: HH:MM
+            if not counter_time_raw or not re.match(r'^\d{2}:\d{2}$', counter_time_raw):
+                self._html(400, _simple_page("❌", "Invalid time", "Please use HH:MM format."))
+                return
+
+            # Sanitise name: strip HTML, limit length, allow only safe chars
+            name = re.sub(r'[<>&]', '', name_raw)[:60].strip() or "Someone"
+            counter_date = counter_date_raw
+            counter_time = counter_time_raw
             invite = get_invite(token)
             valid, reason = is_invite_valid(invite)
             if not valid:
@@ -1382,13 +1463,14 @@ class Handler(BaseHTTPRequestHandler):
             code  = params.get("code",  [None])[0]
 
             if state and code:
-                if state not in pending_flows:
+                # Load from Supabase first, fall back to memory
+                flow = _load_oauth_flow(state) or pending_flows.pop(state, None)
+                if not flow:
                     self._html(200,
                         "<h2>Session expired</h2>"
                         "<p>Go back to Telegram and send /start to get a new login link.</p>")
                     return
                 try:
-                    flow = pending_flows.pop(state)
                     flow.fetch_token(code=code)
                     save_user_creds(int(state), flow.credentials)
                     self._html(200,

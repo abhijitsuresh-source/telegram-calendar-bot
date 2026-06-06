@@ -1,6 +1,6 @@
 -- ============================================================
 -- CalendarBot SaaS — Supabase Migration (with RLS)
--- Run this in your Supabase SQL editor
+-- Run this ONCE in your Supabase SQL editor
 -- ============================================================
 
 -- 1. Subscriptions table
@@ -26,12 +26,23 @@ CREATE TABLE IF NOT EXISTS rate_limits (
     window_start  TIMESTAMPTZ DEFAULT NOW()
 );
 
--- 3. Indexes for fast lookups
-CREATE INDEX IF NOT EXISTS idx_subscriptions_telegram_id    ON subscriptions(telegram_id);
-CREATE INDEX IF NOT EXISTS idx_subscriptions_status         ON subscriptions(status);
+-- 3. OAuth flows table (persists OAuth state across server restarts)
+CREATE TABLE IF NOT EXISTS oauth_flows (
+    key        TEXT PRIMARY KEY,
+    flow_data  TEXT NOT NULL,       -- encrypted serialised OAuth flow
+    is_invite  BOOLEAN DEFAULT false,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Auto-expire flows after 10 minutes (cleanup old ones)
+CREATE INDEX IF NOT EXISTS idx_oauth_flows_created_at ON oauth_flows(created_at);
+
+-- 4. Indexes for fast lookups
+CREATE INDEX IF NOT EXISTS idx_subscriptions_telegram_id     ON subscriptions(telegram_id);
+CREATE INDEX IF NOT EXISTS idx_subscriptions_status          ON subscriptions(status);
 CREATE INDEX IF NOT EXISTS idx_subscriptions_razorpay_sub_id ON subscriptions(razorpay_sub_id);
 
--- 4. Auto-update updated_at on subscriptions
+-- 5. Auto-update updated_at on subscriptions
 CREATE OR REPLACE FUNCTION update_updated_at()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -45,7 +56,7 @@ CREATE TRIGGER subscriptions_updated_at
     BEFORE UPDATE ON subscriptions
     FOR EACH ROW EXECUTE FUNCTION update_updated_at();
 
--- 5. Active subscribers view
+-- 6. Active subscribers view
 CREATE OR REPLACE VIEW active_subscribers AS
 SELECT
     s.telegram_id,
@@ -60,37 +71,49 @@ WHERE s.status IN ('active', 'trial')
   AND (s.status = 'active' OR s.trial_ends_at > NOW());
 
 -- ============================================================
--- RLS — Row Level Security
--- Your bot uses the service_role key (set in SUPABASE_KEY),
--- which bypasses RLS entirely, so the bot always works.
--- RLS only affects connections using the anon key —
--- meaning no one can read your data via the public API.
+-- RLS — Lock down all tables
+-- Your bot uses the service_role key which bypasses RLS.
+-- The anon key (public) is blocked from everything.
 -- ============================================================
 
--- Enable RLS on both tables
+-- Enable RLS on new tables
 ALTER TABLE subscriptions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE rate_limits   ENABLE ROW LEVEL SECURITY;
+ALTER TABLE oauth_flows   ENABLE ROW LEVEL SECURITY;
 
--- Drop policies if they already exist (safe to re-run)
+-- Enable RLS on existing tables
+ALTER TABLE users   ENABLE ROW LEVEL SECURITY;
+ALTER TABLE invites ENABLE ROW LEVEL SECURITY;
+
+-- Drop any existing policies (safe to re-run)
+DROP POLICY IF EXISTS "No public access to oauth_flows"    ON oauth_flows;
 DROP POLICY IF EXISTS "No public access to subscriptions" ON subscriptions;
 DROP POLICY IF EXISTS "No public access to rate_limits"   ON rate_limits;
+DROP POLICY IF EXISTS "No public access to users"         ON users;
+DROP POLICY IF EXISTS "No public access to invites"       ON invites;
 
--- Block all access via the anon/public key
--- (your bot uses service_role which bypasses this)
+-- Block anon access to all tables
+CREATE POLICY "No public access to oauth_flows"
+    ON oauth_flows FOR ALL TO anon USING (false);
+
 CREATE POLICY "No public access to subscriptions"
-    ON subscriptions
-    FOR ALL
-    TO anon
-    USING (false);
+    ON subscriptions FOR ALL TO anon USING (false);
 
 CREATE POLICY "No public access to rate_limits"
-    ON rate_limits
-    FOR ALL
-    TO anon
-    USING (false);
+    ON rate_limits FOR ALL TO anon USING (false);
+
+CREATE POLICY "No public access to users"
+    ON users FOR ALL TO anon USING (false);
+
+CREATE POLICY "No public access to invites"
+    ON invites FOR ALL TO anon USING (false);
+
+-- Lock down the active_subscribers view
+REVOKE SELECT ON active_subscribers FROM anon;
+REVOKE SELECT ON active_subscribers FROM public;
+GRANT  SELECT ON active_subscribers TO service_role;
 
 -- ============================================================
--- IMPORTANT: Make sure SUPABASE_KEY in your Render environment
--- is your SERVICE ROLE key, not the anon key.
--- Dashboard → Settings → API → service_role (secret)
+-- Done! All tables are locked. Only your bot (service_role)
+-- can read and write data.
 -- ============================================================
