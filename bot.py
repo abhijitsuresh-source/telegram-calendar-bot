@@ -12,7 +12,7 @@ from urllib.parse import urlparse, parse_qs
 
 import httpx
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from groq import Groq
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
@@ -897,13 +897,13 @@ Your AI-powered Google Calendar assistant — add, edit, and share events just b
 🗑 Delete events — _"Cancel my Monday meeting"_
 📋 List upcoming events — _"Show my schedule"_
 📨 Invite people to meetings — _"Invite Rahul to my 3pm call"_
-🔄 Let invitees counter-propose a different time
+🔄 Let invitees accept, decline, or suggest a different time
 
-*Try saying:*
-- _"Submit report by Friday EOD"_
-- _"Client dinner on April 25th at 8pm"_
-- _"Every weekday at 9am — morning standup"_
-- _"Invite Priya to my Tuesday meeting"_
+*Just type naturally — no commands needed!*
+_"Show my plans"_ or _"pricing"_ → see subscription plans
+_"upgrade"_ or _"upgrade to pro"_ → upgrade your plan
+_"cancel subscription"_ → cancel your plan
+_"help"_ → see this guide anytime
 
 First, connect your Google Calendar below 👇
 
@@ -937,7 +937,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• _Every weekday at 9am — standup_\n"
             "• _Move my dentist to 4pm_\n"
             "• _Invite Rahul to my Tuesday meeting_\n"
-            "• _Show my upcoming events_" + sub_line,
+            "• _Show my upcoming events_\n\n"
+            "_Type *help* to see all features · *plans* or *pricing* to manage your subscription._" + sub_line,
             parse_mode="Markdown")
     else:
         auth_url = make_auth_url(tid)
@@ -1041,26 +1042,169 @@ async def _check_access(update: Update) -> bool:
         if reason == "trial_expired":
             await update.message.reply_text(
                 "⏳ *Your free trial has ended.*\n\n"
-                "Subscribe to continue using CalendarBot:\n\n"
-                "👉 /subscribe",
+                'Type *"plans"* or *"pricing"* to subscribe and continue.',
                 parse_mode="Markdown")
         elif reason in ("cancelled", "expired"):
             await update.message.reply_text(
                 "🔒 *Your subscription is inactive.*\n\n"
-                "Reactivate it with /subscribe",
+                'Type *"plans"* or *"pricing"* to reactivate.',
                 parse_mode="Markdown")
         else:
             await update.message.reply_text(
-                "🔒 *Access restricted.*\n\nUse /subscribe to get started.",
+                "🔒 *Access restricted.*\n\n"
+                'Type *"plans"* or *"pricing"* to get started.',
                 parse_mode="Markdown")
         return False
     return True
+
+async def handle_subscribe(update, telegram_id: int, plan: str = None):
+    """Handle conversational subscribe / pricing / plans request."""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    from razorpay_billing import PLANS
+
+    if not RAZORPAY_BILLING_ENABLED:
+        await update.message.reply_text("\U0001f4b3 Billing is not configured yet. Check back soon!")
+        return
+
+    allowed, reason = is_subscribed(telegram_id)
+    if reason == "active":
+        sub = get_subscription(telegram_id)
+        current_plan = sub.get("plan", "basic") if sub else "basic"
+        if current_plan == "pro":
+            await update.message.reply_text(
+                "\u2705 *You're already on the Pro plan!*\n\nYou have access to every feature CalendarBot offers.",
+                parse_mode="Markdown")
+        else:
+            await handle_upgrade(update, telegram_id)
+        return
+
+    lines = []
+    buttons = []
+    for key, p in PLANS.items():
+        features = "\n".join(f"\u2022 {f}" for f in p["features"])
+        lines.append(f"*{p['label']} \u2014 \u20b9{p['price']}/month*\n{features}")
+        buttons.append(InlineKeyboardButton(f"Get {p['label']} \u2014 \u20b9{p['price']}/mo", callback_data=f"subscribe_{key}"))
+
+    keyboard = InlineKeyboardMarkup([[b] for b in buttons])
+    await update.message.reply_text(
+        "\U0001f4b3 *CalendarBot Plans*\n\n" + "\n\n".join(lines) + "\n\n_Tap a plan to subscribe:_",
+        parse_mode="Markdown",
+        reply_markup=keyboard)
+
+
+async def handle_upgrade(update, telegram_id: int):
+    """Handle conversational upgrade to Pro request."""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    if not RAZORPAY_BILLING_ENABLED:
+        await update.message.reply_text("\U0001f4b3 Billing is not configured yet. Check back soon!")
+        return
+
+    allowed, reason = is_subscribed(telegram_id)
+    if reason != "active":
+        await handle_subscribe(update, telegram_id)
+        return
+
+    sub = get_subscription(telegram_id)
+    current_plan = sub.get("plan", "basic") if sub else "basic"
+
+    if current_plan == "pro":
+        await update.message.reply_text(
+            "\U0001f451 *You're already on the Pro plan \u2014 the best we offer!*\n\n"
+            "You have full access to every feature including calendar invites and priority support.",
+            parse_mode="Markdown")
+        return
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("\u2b06\ufe0f Upgrade to Pro \u2014 \u20b9499/mo", callback_data="subscribe_pro")
+    ]])
+    await update.message.reply_text(
+        "\u2b06\ufe0f *Upgrade to Pro \u2014 \u20b9499/month*\n\n"
+        "Everything in Basic, plus:\n"
+        "\u2022 Send calendar invites to others\n"
+        "\u2022 Invitees can accept, decline, or suggest a different time\n"
+        "\u2022 Priority support via WhatsApp, call & email\n\n"
+        "_Tap below to upgrade:_",
+        parse_mode="Markdown",
+        reply_markup=keyboard)
+
+
+async def handle_cancel_sub(update, telegram_id: int):
+    """Handle conversational cancel subscription request."""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    allowed, reason = is_subscribed(telegram_id)
+    if reason != "active":
+        await update.message.reply_text("You don't have an active subscription to cancel.")
+        return
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("\u274c Yes, cancel my subscription", callback_data="confirm_cancel"),
+        InlineKeyboardButton("\u2b05\ufe0f No, keep it", callback_data="keep_sub"),
+    ]])
+    await update.message.reply_text(
+        "\U0001f914 *Are you sure you want to cancel?*\n\n"
+        "Your access will continue until the end of your current billing period.",
+        parse_mode="Markdown",
+        reply_markup=keyboard)
+
+
+async def handle_callback(update, context):
+    """Handle inline button callbacks."""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    query = update.callback_query
+    await query.answer()
+    tid = query.from_user.id
+    data = query.data
+
+    if data.startswith("subscribe_"):
+        plan = data.replace("subscribe_", "")
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text("\u23f3 Generating your payment link\u2026")
+        customer_id = create_or_get_customer(tid)
+        sub_id, payment_url = create_subscription(plan, customer_id, tid)
+        if not payment_url:
+            await query.message.reply_text("\u274c Could not create payment link. Please try again or contact support.")
+            return
+        from razorpay_billing import PLANS
+        p = PLANS[plan]
+        await query.message.reply_text(
+            f"\U0001f4b3 *{p['label']} Plan \u2014 \u20b9{p['price']}/month*\n\n"
+            f"Click the link below to complete payment.\n"
+            f"Your bot access will activate instantly after payment.\n\n"
+            f"[\U0001f449 Pay \u20b9{p['price']} via Razorpay]({payment_url})\n\n"
+            f"_Link expires in 15 minutes._",
+            parse_mode="Markdown",
+            disable_web_page_preview=True)
+
+    elif data == "confirm_cancel":
+        await query.edit_message_reply_markup(reply_markup=None)
+        sub = get_subscription(tid)
+        razorpay_sub_id = sub.get("razorpay_sub_id") if sub else None
+        if razorpay_sub_id:
+            success = cancel_subscription(razorpay_sub_id)
+            if success:
+                await query.message.reply_text(
+                    "\u2705 Your subscription has been cancelled and will not renew.\n\n"
+                    "You can continue using the bot until the end of your current billing period.")
+            else:
+                await query.message.reply_text(
+                    "\u274c Could not cancel. Please contact support via WhatsApp or email.")
+        else:
+            deactivate_subscription(tid)
+            await query.message.reply_text("Your subscription has been cancelled.")
+
+    elif data == "keep_sub":
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text("\U0001f44d All good! Your subscription is still active.")
+
 
 async def send_help_message(update, telegram_id: int, unknown: bool = False):
     """Send a rich help message with plan-aware subscription info and support buttons."""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
     allowed, reason = is_subscribed(telegram_id)
+    show_upgrade_button = False
 
     # Subscription status block
     if reason == "billing_disabled":
@@ -1077,40 +1221,37 @@ async def send_help_message(update, telegram_id: int, unknown: bool = False):
         if plan == "pro":
             sub_block = (
                 "\n\n\U0001f451 *You're on the Pro plan \u2014 the best of CalendarBot!*\n"
-                "You have full access to every feature including calendar invites, "
-                "invite responses, and priority support. You're all set!"
+                "You have full access to every feature. You're one of our top users!"
             )
         else:
             sub_block = (
                 "\n\n\u2b06\ufe0f *Upgrade to Pro \u2014 \u20b9499/month*\n"
                 "Unlock calendar invites, let invitees accept/decline or suggest a different time, "
                 "and get priority support.\n"
-                "\U0001f449 /subscribe pro"
+                '_Just type "upgrade" or tap the button below._'
             )
+            show_upgrade_button = True
     elif reason.startswith("trial:"):
         days = reason.split(":")[1]
         sub_block = (
             f"\n\n\u23f3 *Free trial \u2014 {days} day(s) left*\n"
-            "Subscribe to keep using CalendarBot after your trial ends.\n"
-            "\U0001f449 /subscribe"
+            'Subscribe to keep using CalendarBot. Type "plans" or "pricing" to see options.'
         )
     elif reason == "trial_expired":
         sub_block = (
             "\n\n\U0001f512 *Your free trial has ended.*\n"
-            "Subscribe to continue using CalendarBot.\n"
-            "\U0001f449 /subscribe"
+            'Type "plans" or "pricing" to subscribe and continue.'
         )
     else:
         sub_block = (
             "\n\n\U0001f512 *Subscription inactive.*\n"
-            "Reactivate to keep using CalendarBot.\n"
-            "\U0001f449 /subscribe"
+            'Type "plans" or "pricing" to reactivate.'
         )
 
     intro = (
         "\U0001f914 *Not sure what you meant.* Here's what I can do:\n\n"
         if unknown else
-        "\U0001f4c5 *CalendarBot Help*\n\nJust talk to me naturally!\n\n"
+        "\U0001f4c5 *CalendarBot Help*\n\nJust talk to me naturally \u2014 no commands needed!\n\n"
     )
 
     text = (
@@ -1124,24 +1265,30 @@ async def send_help_message(update, telegram_id: int, unknown: bool = False):
         "\u2022 _Change my dentist to 4pm_\n"
         "\u2022 _Rename standup to Team Sync_\n"
         "\u2022 _Delete my Monday meeting_\n\n"
-        "*\U0001f4cb Other:*\n"
+        "*\U0001f4cb Other things to type:*\n"
         "\u2022 _Show my upcoming events_\n"
         "\u2022 _Am I connected?_\n"
-        "\u2022 _Disconnect my Google account_" +
+        "\u2022 _Disconnect my Google account_\n"
+        "\u2022 _plans_ or _pricing_ \u2014 see subscription options\n"
+        "\u2022 _upgrade_ or _upgrade to pro_ \u2014 upgrade your plan\n"
+        "\u2022 _cancel subscription_ \u2014 cancel your plan" +
         sub_block
     )
 
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("\U0001f4ac WhatsApp", url="https://wa.me/919496784855"),
-            InlineKeyboardButton("\U0001f4de Call", url="tel:+919496784855"),
-            InlineKeyboardButton("\u2709\ufe0f Email", url="mailto:abhijitsuresh99@gmail.com"),
-        ],
+    # Build keyboard
+    button_rows = []
+    if show_upgrade_button:
+        button_rows.append([
+            InlineKeyboardButton("\u2b06\ufe0f Upgrade to Pro \u2014 \u20b9499/mo", callback_data="subscribe_pro")
+        ])
+    button_rows.append([
+        InlineKeyboardButton("\U0001f4ac WhatsApp", url="https://wa.me/919496784855"),
+        InlineKeyboardButton("\U0001f4de Call", url="tel:+919496784855"),
+        InlineKeyboardButton("\u2709\ufe0f Email", url="mailto:abhijitsuresh99@gmail.com"),
     ])
+    keyboard = InlineKeyboardMarkup(button_rows)
 
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
-
-
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tid = update.effective_user.id
     text = update.message.text
@@ -1171,6 +1318,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown")
     elif intent == "HELP":
         await send_help_message(update, tid)
+    elif intent == "SUBSCRIBE":
+        await handle_subscribe(update, tid)
+    elif intent == "UPGRADE":
+        await handle_upgrade(update, tid)
+    elif intent == "CANCEL_SUB":
+        await handle_cancel_sub(update, tid)
     elif intent == "UNKNOWN":
         await send_help_message(update, tid, unknown=True)
     else:
@@ -1665,6 +1818,7 @@ def main():
     telegram_app.add_handler(CommandHandler("start", cmd_start))
     telegram_app.add_handler(CommandHandler("subscribe", cmd_subscribe))
     telegram_app.add_handler(CommandHandler("cancel", cmd_cancel))
+    telegram_app.add_handler(CallbackQueryHandler(handle_callback))
     telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     telegram_app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     telegram_app.add_handler(MessageHandler(filters.Document.ALL, on_document))
