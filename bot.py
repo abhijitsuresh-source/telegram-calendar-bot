@@ -1056,6 +1056,92 @@ async def _check_access(update: Update) -> bool:
         return False
     return True
 
+async def send_help_message(update, telegram_id: int, unknown: bool = False):
+    """Send a rich help message with plan-aware subscription info and support buttons."""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    allowed, reason = is_subscribed(telegram_id)
+
+    # Subscription status block
+    if reason == "billing_disabled":
+        sub_block = ""
+    elif reason == "active":
+        plan = "basic"
+        try:
+            row = supabase.table("subscriptions").select("plan").eq("telegram_id", telegram_id).maybe_single().execute()
+            if row.data:
+                plan = row.data.get("plan", "basic")
+        except Exception:
+            pass
+
+        if plan == "pro":
+            sub_block = (
+                "\n\n\U0001f451 *You're on the Pro plan \u2014 the best of CalendarBot!*\n"
+                "You have full access to every feature including calendar invites, "
+                "invite responses, and priority support. You're all set!"
+            )
+        else:
+            sub_block = (
+                "\n\n\u2b06\ufe0f *Upgrade to Pro \u2014 \u20b9499/month*\n"
+                "Unlock calendar invites, let invitees accept/decline or suggest a different time, "
+                "and get priority support.\n"
+                "\U0001f449 /subscribe pro"
+            )
+    elif reason.startswith("trial:"):
+        days = reason.split(":")[1]
+        sub_block = (
+            f"\n\n\u23f3 *Free trial \u2014 {days} day(s) left*\n"
+            "Subscribe to keep using CalendarBot after your trial ends.\n"
+            "\U0001f449 /subscribe"
+        )
+    elif reason == "trial_expired":
+        sub_block = (
+            "\n\n\U0001f512 *Your free trial has ended.*\n"
+            "Subscribe to continue using CalendarBot.\n"
+            "\U0001f449 /subscribe"
+        )
+    else:
+        sub_block = (
+            "\n\n\U0001f512 *Subscription inactive.*\n"
+            "Reactivate to keep using CalendarBot.\n"
+            "\U0001f449 /subscribe"
+        )
+
+    intro = (
+        "\U0001f914 *Not sure what you meant.* Here's what I can do:\n\n"
+        if unknown else
+        "\U0001f4c5 *CalendarBot Help*\n\nJust talk to me naturally!\n\n"
+    )
+
+    text = (
+        intro +
+        "*\u2795 Adding events:*\n"
+        "\u2022 _Dentist tomorrow at 3pm_\n"
+        "\u2022 _Team standup every Monday at 10am_\n"
+        "\u2022 _Submit report by Friday EOD_\n"
+        "\u2022 Send a *voice note*, *photo*, or *PDF* too!\n\n"
+        "*\u270f\ufe0f Editing & deleting:*\n"
+        "\u2022 _Change my dentist to 4pm_\n"
+        "\u2022 _Rename standup to Team Sync_\n"
+        "\u2022 _Delete my Monday meeting_\n\n"
+        "*\U0001f4cb Other:*\n"
+        "\u2022 _Show my upcoming events_\n"
+        "\u2022 _Am I connected?_\n"
+        "\u2022 _Disconnect my Google account_" +
+        sub_block
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("\U0001f4ac WhatsApp", url="https://wa.me/919496784855"),
+            InlineKeyboardButton("\U0001f4de Call", url="tel:+919496784855"),
+            InlineKeyboardButton("\u2709\ufe0f Email", url="mailto:abhijitsuresh99@gmail.com"),
+        ],
+    ])
+
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tid = update.effective_user.id
     text = update.message.text
@@ -1084,23 +1170,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"❌ Not connected. [Click here to connect]({auth_url})",
                 parse_mode="Markdown")
     elif intent == "HELP":
-        await update.message.reply_text(
-            "🤖 *CalendarBot Help*\n\n"
-            "Just talk to me naturally!\n\n"
-            "*Adding events:*\n"
-            "• _Dentist tomorrow at 3pm_\n"
-            "• _Team meeting every Monday 10am_\n"
-            "• _Submit report by Friday EOD_\n\n"
-            "*Editing events:*\n"
-            "• _Change my dentist to 4pm_\n"
-            "• _Rename standup to Team Sync_\n"
-            "• _Delete my Monday meeting_\n\n"
-            "*Other:*\n"
-            "• _Show my upcoming events_\n"
-            "• _Am I connected?_\n"
-            "• _Disconnect my Google account_\n\n"
-            "You can also send voice messages, photos, or PDFs!",
-            parse_mode="Markdown")
+        await send_help_message(update, tid)
+    elif intent == "UNKNOWN":
+        await send_help_message(update, tid, unknown=True)
     else:
         await handle_add(update, lambda: extract_text(text), tid)
 
