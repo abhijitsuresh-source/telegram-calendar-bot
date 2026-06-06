@@ -1198,6 +1198,9 @@ async def handle_callback(update, context):
         await query.edit_message_reply_markup(reply_markup=None)
         await query.message.reply_text("\U0001f44d All good! Your subscription is still active.")
 
+    elif data == "noop":
+        pass  # Info-only buttons, no action needed
+
 
 async def send_help_message(update, telegram_id: int, unknown: bool = False):
     """Send a rich help message with plan-aware subscription info and support buttons."""
@@ -1282,9 +1285,11 @@ async def send_help_message(update, telegram_id: int, unknown: bool = False):
             InlineKeyboardButton("\u2b06\ufe0f Upgrade to Pro \u2014 \u20b9499/mo", callback_data="subscribe_pro")
         ])
     button_rows.append([
-        InlineKeyboardButton("\U0001f4ac WhatsApp", url="https://wa.me/919496784855"),
-        InlineKeyboardButton("\U0001f4de Call", url="tel:+919496784855"),
-        InlineKeyboardButton("\u2709\ufe0f Email", url="mailto:abhijitsuresh99@gmail.com"),
+        InlineKeyboardButton("💬 WhatsApp", url="https://wa.me/919496784855"),
+    ])
+    button_rows.append([
+        InlineKeyboardButton("✉️ Email: abhijitsuresh99@gmail.com", callback_data="noop"),
+        InlineKeyboardButton("📞 Call: +91 94967 84855", callback_data="noop"),
     ])
     keyboard = InlineKeyboardMarkup(button_rows)
 
