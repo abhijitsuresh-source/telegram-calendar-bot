@@ -41,7 +41,6 @@ PLANS = {
             "Everything in Basic",
             "Send calendar invites to others",
             "Invitees can accept, decline, or suggest a different time",
-            "Priority support — WhatsApp wa.me/919496784855 · Call +919496784855 · abhijitsuresh99@gmail.com",
         ],
     },
 }

@@ -924,12 +924,11 @@ async def build_bot_message(telegram_id: int, is_start: bool = True):
     pro_features = [
         ("📨", "*Invite people* to meetings \u2014 _Invite Rahul to my 3pm call_"),
         ("🔁", "Invitees can *accept, decline, or suggest a different time*"),
-        ("🏆", "*Priority support* \u2014 WhatsApp & email"),
     ]
 
     lines_basic = "\n\n".join(f"{e} {t}" for e, t in basic_features)
     if locked:
-        lines_pro = "\n\n".join(f"{e} ~{t}~ _(Pro only)_" for e, t in pro_features)
+        lines_pro = "\n\n".join(f"\U0001f512 {e} {t} _(Pro only)_" for e, t in pro_features)
     else:
         lines_pro = "\n\n".join(f"{e} {t}" for e, t in pro_features)
 
@@ -1009,11 +1008,23 @@ async def build_bot_message(telegram_id: int, is_start: bool = True):
         if not is_start:
             intro = "🤔 *Not sure what you meant \u2014 but here's what I can do:*\n\n"
 
+    other_commands = (
+        "\U0001f4cb *Other commands \u2014 just type naturally:*\n\n"
+        "\u2022 _Show my upcoming events_\n"
+        "\u2022 _Am I connected?_\n"
+        "\u2022 _Disconnect my Google account_\n"
+        "\u2022 _plans_ or _pricing_ \u2014 see subscription options\n"
+        "\u2022 _upgrade_ or _upgrade to pro_ \u2014 upgrade your plan\n"
+        "\u2022 _cancel subscription_ \u2014 cancel your plan"
+    )
+
     text = (
         intro
         + lines_basic
         + "\n\n"
         + lines_pro
+        + "\n\n\u2014\u2014\u2014\n\n"
+        + other_commands
         + "\n\n\u2014\u2014\u2014\n\n"
         + plan_section
         + status_block
@@ -1224,8 +1235,7 @@ async def handle_upgrade(update, telegram_id: int):
         "\u2b06\ufe0f *Upgrade to Pro \u2014 \u20b9499/month*\n\n"
         "Everything in Basic, plus:\n"
         "\u2022 Send calendar invites to others\n"
-        "\u2022 Invitees can accept, decline, or suggest a different time\n"
-        "\u2022 Priority support via WhatsApp, call & email\n\n"
+        "\u2022 Invitees can accept, decline, or suggest a different time\n\n"
         "_Tap below to upgrade:_",
         parse_mode="Markdown",
         reply_markup=keyboard)
