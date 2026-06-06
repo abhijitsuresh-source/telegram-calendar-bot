@@ -905,28 +905,39 @@ _"upgrade"_ or _"upgrade to pro"_ → upgrade your plan
 _"cancel subscription"_ → cancel your plan
 _"help"_ → see this guide anytime
 
-First, connect your Google Calendar below 👇
-
-_Need help? [WhatsApp us](https://wa.me/919496784855) · Call +919496784855 · abhijitsuresh99@gmail.com_"""
+First, connect your Google Calendar below 👇"""
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     tid = update.effective_user.id
     ensure_trial(tid)
     allowed, reason = is_subscribed(tid)
     creds = get_user_creds(tid)
 
-    # Build subscription status line
+    # Build subscription status line and buttons
+    button_rows = []
     if reason == "billing_disabled":
         sub_line = ""
     elif reason == "active":
-        sub_line = "\n✅ *Subscription active*"
+        sub = get_subscription(tid)
+        plan = sub.get("plan", "basic") if sub else "basic"
+        if plan == "pro":
+            sub_line = "\n\n\U0001f451 *You're on the Pro plan*"
+        else:
+            sub_line = "\n\n\u2705 *Basic plan active* \u2014 type _upgrade_ to get Pro"
+            button_rows.append([InlineKeyboardButton("\u2b06\ufe0f Upgrade to Pro \u2014 \u20b9499/mo", callback_data="subscribe_pro")])
     elif reason.startswith("trial:"):
         days = reason.split(":")[1]
-        sub_line = f"\n⏳ *Free trial — {days} day(s) left* · /subscribe to continue"
+        sub_line = f"\n\n\u23f3 *Free trial \u2014 {days} day(s) left*\nSubscribe before your trial ends to keep all your events and reminders."
+        button_rows.append([InlineKeyboardButton("\U0001f4b3 See Subscription Plans", callback_data="show_plans")])
     elif reason == "trial_expired":
-        sub_line = "\n🔒 *Trial expired* · Use /subscribe to unlock"
+        sub_line = "\n\n\U0001f512 *Your free trial has ended.* Subscribe to continue."
+        button_rows.append([InlineKeyboardButton("\U0001f4b3 See Subscription Plans", callback_data="show_plans")])
     else:
-        sub_line = "\n🔒 *Subscription inactive* · Use /subscribe to reactivate"
+        sub_line = "\n\n\U0001f512 *Subscription inactive.* Reactivate to continue."
+        button_rows.append([InlineKeyboardButton("\U0001f4b3 See Subscription Plans", callback_data="show_plans")])
+
+    keyboard = InlineKeyboardMarkup(button_rows) if button_rows else None
 
     if creds:
         await update.message.reply_text(
@@ -939,12 +950,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• _Invite Rahul to my Tuesday meeting_\n"
             "• _Show my upcoming events_\n\n"
             "_Type *help* to see all features · *plans* or *pricing* to manage your subscription._" + sub_line,
-            parse_mode="Markdown")
+            parse_mode="Markdown",
+            reply_markup=keyboard)
     else:
         auth_url = make_auth_url(tid)
+        button_rows.insert(0, [InlineKeyboardButton("📅 Connect Google Calendar", url=auth_url)])
+        keyboard = InlineKeyboardMarkup(button_rows)
         await update.message.reply_text(
-            WELCOME_MESSAGE + f"\n\n[👉 Connect Google Calendar]({auth_url})" + sub_line,
-            parse_mode="Markdown")
+            WELCOME_MESSAGE,
+            parse_mode="Markdown",
+            reply_markup=keyboard)
 
 async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show subscription plans and payment links."""
@@ -1206,8 +1221,22 @@ async def handle_callback(update, context):
         pass  # Info-only buttons, no action needed
 
     elif data == "show_plans":
+        from razorpay_billing import PLANS
         await query.edit_message_reply_markup(reply_markup=None)
-        await handle_subscribe(query.message, tid)
+        if not RAZORPAY_BILLING_ENABLED:
+            await query.message.reply_text("\U0001f4b3 Billing is not configured yet. Check back soon!")
+            return
+        lines = []
+        buttons = []
+        for key, p in PLANS.items():
+            features = "\n".join(f"\u2022 {f}" for f in p["features"])
+            lines.append(f"*{p['label']} \u2014 \u20b9{p['price']}/month*\n{features}")
+            buttons.append(InlineKeyboardButton(f"Get {p['label']} \u2014 \u20b9{p['price']}/mo", callback_data=f"subscribe_{key}"))
+        keyboard = InlineKeyboardMarkup([[b] for b in buttons])
+        await query.message.reply_text(
+            "\U0001f4b3 *CalendarBot Plans*\n\n" + "\n\n".join(lines) + "\n\n_Tap a plan to subscribe:_",
+            parse_mode="Markdown",
+            reply_markup=keyboard)
 
 
 async def send_help_message(update, telegram_id: int, unknown: bool = False):
@@ -1279,20 +1308,31 @@ async def send_help_message(update, telegram_id: int, unknown: bool = False):
         "*\U0001f4b3 Subscription:*\n"
         "\u2022 _plans_ or _pricing_ \u2014 see plans\n"
         "\u2022 _upgrade_ \u2014 upgrade to Pro\n"
-        "\u2022 _cancel subscription_ \u2014 cancel your plan" +
+        "\u2022 _cancel subscription_ \u2014 cancel your plan\n\n"
+        "*\U0001f4cb Other commands:*\n"
+        "\u2022 _Show my upcoming events_\n"
+        "\u2022 _Am I connected?_\n"
+        "\u2022 _Disconnect my Google account_" +
         sub_block
     )
 
     # Build keyboard
     button_rows = []
 
-    # Google connect button if not connected
+    # If not connected to Google, show a simple nudge instead of the full help
     creds = get_user_creds(telegram_id)
     if not creds:
         auth_url = make_auth_url(telegram_id)
-        button_rows.append([
+        keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton("\U0001f4c5 Connect Google Calendar", url=auth_url)
-        ])
+        ]])
+        await update.message.reply_text(
+            "\U0001f4c5 *You haven't connected your Google Calendar yet.*\n\n"
+            "Connect your account to start adding events, setting reminders, and inviting people to meetings.\n\n"
+            "Tap the button below or send /start to get started!",
+            parse_mode="Markdown",
+            reply_markup=keyboard)
+        return
 
     if show_subscribe_button:
         button_rows.append([
