@@ -1039,21 +1039,25 @@ async def _check_access(update: Update) -> bool:
     # Subscription check
     allowed, reason = is_subscribed(tid)
     if not allowed:
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        subscribe_keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("\U0001f4b3 See Subscription Plans", callback_data="show_plans")
+        ]])
         if reason == "trial_expired":
             await update.message.reply_text(
-                "⏳ *Your free trial has ended.*\n\n"
-                'Type *"plans"* or *"pricing"* to subscribe and continue.',
-                parse_mode="Markdown")
+                "\u23f3 *Your free trial has ended.*\n\nSubscribe to continue using CalendarBot.",
+                parse_mode="Markdown",
+                reply_markup=subscribe_keyboard)
         elif reason in ("cancelled", "expired"):
             await update.message.reply_text(
-                "🔒 *Your subscription is inactive.*\n\n"
-                'Type *"plans"* or *"pricing"* to reactivate.',
-                parse_mode="Markdown")
+                "\U0001f512 *Your subscription is inactive.*\n\nReactivate to keep using CalendarBot.",
+                parse_mode="Markdown",
+                reply_markup=subscribe_keyboard)
         else:
             await update.message.reply_text(
-                "🔒 *Access restricted.*\n\n"
-                'Type *"plans"* or *"pricing"* to get started.',
-                parse_mode="Markdown")
+                "\U0001f512 *Access restricted.*\n\nSubscribe to get started.",
+                parse_mode="Markdown",
+                reply_markup=subscribe_keyboard)
         return False
     return True
 
@@ -1201,6 +1205,10 @@ async def handle_callback(update, context):
     elif data == "noop":
         pass  # Info-only buttons, no action needed
 
+    elif data == "show_plans":
+        await query.edit_message_reply_markup(reply_markup=None)
+        await handle_subscribe(query.message, tid)
+
 
 async def send_help_message(update, telegram_id: int, unknown: bool = False):
     """Send a rich help message with plan-aware subscription info and support buttons."""
@@ -1210,6 +1218,7 @@ async def send_help_message(update, telegram_id: int, unknown: bool = False):
     show_upgrade_button = False
 
     # Subscription status block
+    show_subscribe_button = False
     if reason == "billing_disabled":
         sub_block = ""
     elif reason == "active":
@@ -1230,26 +1239,19 @@ async def send_help_message(update, telegram_id: int, unknown: bool = False):
             sub_block = (
                 "\n\n\u2b06\ufe0f *Upgrade to Pro \u2014 \u20b9499/month*\n"
                 "Unlock calendar invites, let invitees accept/decline or suggest a different time, "
-                "and get priority support.\n"
-                '_Just type "upgrade" or tap the button below._'
+                "and get priority support."
             )
             show_upgrade_button = True
     elif reason.startswith("trial:"):
         days = reason.split(":")[1]
-        sub_block = (
-            f"\n\n\u23f3 *Free trial \u2014 {days} day(s) left*\n"
-            'Subscribe to keep using CalendarBot. Type "plans" or "pricing" to see options.'
-        )
+        sub_block = f"\n\n\u23f3 *Free trial \u2014 {days} day(s) left*\nSubscribe to keep using CalendarBot after your trial ends."
+        show_subscribe_button = True
     elif reason == "trial_expired":
-        sub_block = (
-            "\n\n\U0001f512 *Your free trial has ended.*\n"
-            'Type "plans" or "pricing" to subscribe and continue.'
-        )
+        sub_block = "\n\n\U0001f512 *Your free trial has ended.* Subscribe to continue using CalendarBot."
+        show_subscribe_button = True
     else:
-        sub_block = (
-            "\n\n\U0001f512 *Subscription inactive.*\n"
-            'Type "plans" or "pricing" to reactivate.'
-        )
+        sub_block = "\n\n\U0001f512 *Subscription inactive.* Reactivate to keep using CalendarBot."
+        show_subscribe_button = True
 
     intro = (
         "\U0001f914 *Not sure what you meant.* Here's what I can do:\n\n"
@@ -1268,18 +1270,34 @@ async def send_help_message(update, telegram_id: int, unknown: bool = False):
         "\u2022 _Change my dentist to 4pm_\n"
         "\u2022 _Rename standup to Team Sync_\n"
         "\u2022 _Delete my Monday meeting_\n\n"
-        "*\U0001f4cb Other things to type:*\n"
-        "\u2022 _Show my upcoming events_\n"
-        "\u2022 _Am I connected?_\n"
-        "\u2022 _Disconnect my Google account_\n"
-        "\u2022 _plans_ or _pricing_ \u2014 see subscription options\n"
-        "\u2022 _upgrade_ or _upgrade to pro_ \u2014 upgrade your plan\n"
+        "*\U0001f4c5 View upcoming events:*\n"
+        "\u2022 _Show my schedule_\n"
+        "\u2022 _What do I have this week?_\n\n"
+        "*\U0001f4e8 Invite people to meetings:*\n"
+        "\u2022 _Invite Rahul to my 3pm call_\n"
+        "\u2022 Invitees can accept, decline, or suggest a different time\n\n"
+        "*\U0001f4b3 Subscription:*\n"
+        "\u2022 _plans_ or _pricing_ \u2014 see plans\n"
+        "\u2022 _upgrade_ \u2014 upgrade to Pro\n"
         "\u2022 _cancel subscription_ \u2014 cancel your plan" +
         sub_block
     )
 
     # Build keyboard
     button_rows = []
+
+    # Google connect button if not connected
+    creds = get_user_creds(telegram_id)
+    if not creds:
+        auth_url = make_auth_url(telegram_id)
+        button_rows.append([
+            InlineKeyboardButton("\U0001f4c5 Connect Google Calendar", url=auth_url)
+        ])
+
+    if show_subscribe_button:
+        button_rows.append([
+            InlineKeyboardButton("\U0001f4b3 See Subscription Plans", callback_data="show_plans")
+        ])
     if show_upgrade_button:
         button_rows.append([
             InlineKeyboardButton("\u2b06\ufe0f Upgrade to Pro \u2014 \u20b9499/mo", callback_data="subscribe_pro")
@@ -1288,7 +1306,7 @@ async def send_help_message(update, telegram_id: int, unknown: bool = False):
         InlineKeyboardButton("💬 WhatsApp", url="https://wa.me/919496784855"),
     ])
     button_rows.append([
-        InlineKeyboardButton("✉️ Email: abhijitsuresh99@gmail.com", callback_data="noop"),
+        InlineKeyboardButton("✉️ Email Us", url="https://mail.google.com/mail/?view=cm&to=abhijitsuresh99@gmail.com"),
         InlineKeyboardButton("📞 Call: +91 94967 84855", callback_data="noop"),
     ])
     keyboard = InlineKeyboardMarkup(button_rows)
