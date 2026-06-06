@@ -882,27 +882,32 @@ async def handle_edit_or_delete(update: Update, text: str, telegram_id: int):
 # ── Telegram handlers ──────────────────────────────────────────────────────────
 WELCOME_MESSAGE = """👋 *Welcome to CalendarBot!*
 
-Send me your tasks and appointments in any format — I'll extract the details and add them to your Google Calendar automatically, with reminders 15 min and 5 min before every event.
+Your AI-powered Google Calendar assistant — add, edit, and share events just by chatting.
 
-*Ways to send tasks:*
-📝 *Text* — type your task naturally
-🎤 *Voice note* — speak it out loud
+*Send events in any format:*
+📝 *Text* — _"Dentist tomorrow at 3pm"_ or _"Team standup every Monday at 10am"_
+🎤 *Voice note* — speak naturally, I'll transcribe and extract the event
 🖼 *Photo* — whiteboard, sticky note, handwritten list, screenshot
 📄 *PDF* — meeting notes, documents, any file with dates
 
-*Examples of what to say:*
-- _"Dentist tomorrow at 3pm"_
-- _"Team standup every Monday at 10am"_
+*What I can do:*
+📅 Add one-off and recurring events (daily, weekly, monthly, weekdays)
+⏰ Set reminders automatically — 15 min and 5 min before every event
+✏️ Edit events — _"Move my dentist to 4pm"_
+🗑 Delete events — _"Cancel my Monday meeting"_
+📋 List upcoming events — _"Show my schedule"_
+📨 Invite people to meetings — _"Invite Rahul to my 3pm call"_
+🔄 Let invitees counter-propose a different time
+
+*Try saying:*
 - _"Submit report by Friday EOD"_
-- _"Client dinner on April 25th"_
+- _"Client dinner on April 25th at 8pm"_
+- _"Every weekday at 9am — morning standup"_
+- _"Invite Priya to my Tuesday meeting"_
 
-*Managing your events:*
-- _"Change my dentist to 4pm"_
-- _"Delete my Monday meeting"_
-- _"Show my upcoming events"_
-- _"Disconnect my Google account"_
+First, connect your Google Calendar below 👇
 
-First, connect your Google Calendar below 👇"""
+_Need help? [WhatsApp us](https://wa.me/919496784855) · Call +919496784855 · abhijitsuresh99@gmail.com_"""
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tid = update.effective_user.id
@@ -926,13 +931,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if creds:
         await update.message.reply_text(
             "👋 *Welcome back!*\n\n"
-            "Your Google Calendar is connected. Just send me a message to add events!\n\n"
+            "Your Google Calendar is connected. Send me anything — text, voice, photo, or PDF!\n\n"
             "*Examples:*\n"
             "• _Dentist tomorrow at 3pm_\n"
-            "• _Team standup every Monday 10am_\n"
-            "• _Change my dentist to 4pm_\n"
-            "• _Show my upcoming events_\n"
-            "• _Disconnect my Google account_" + sub_line,
+            "• _Every weekday at 9am — standup_\n"
+            "• _Move my dentist to 4pm_\n"
+            "• _Invite Rahul to my Tuesday meeting_\n"
+            "• _Show my upcoming events_" + sub_line,
             parse_mode="Markdown")
     else:
         auth_url = make_auth_url(tid)

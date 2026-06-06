@@ -25,13 +25,24 @@ PLANS = {
         "plan_id": os.environ.get("RAZORPAY_PLAN_BASIC", ""),   # e.g. plan_ABC123
         "price":   199,   # ₹199/month
         "label":   "Basic",
-        "features": ["Unlimited events", "AI natural language", "Voice & photo input"],
+        "features": [
+            "Add events via text, voice, photo & PDF",
+            "AI understands natural language & recurring events",
+            "Auto reminders 15 min & 5 min before every event",
+            "Edit & delete events by just saying so",
+            "View upcoming events anytime",
+        ],
     },
     "pro": {
         "plan_id": os.environ.get("RAZORPAY_PLAN_PRO", ""),     # e.g. plan_XYZ456
         "price":   499,   # ₹499/month
         "label":   "Pro",
-        "features": ["Everything in Basic", "Calendar invites", "Counter-proposals", "Priority support"],
+        "features": [
+            "Everything in Basic",
+            "Send calendar invites to others",
+            "Invitees can accept, decline, or suggest a different time",
+            "Priority support — WhatsApp wa.me/919496784855 · Call +919496784855 · abhijitsuresh99@gmail.com",
+        ],
     },
 }
 
