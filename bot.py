@@ -1231,7 +1231,6 @@ async def handle_callback(update, context):
 
     if data.startswith("subscribe_"):
         plan = data.replace("subscribe_", "")
-        await query.edit_message_reply_markup(reply_markup=None)
         await query.message.reply_text("\u23f3 Generating your payment link\u2026")
         customer_id = create_or_get_customer(tid)
         sub_id, payment_url = create_subscription(plan, customer_id, tid)
@@ -1250,7 +1249,6 @@ async def handle_callback(update, context):
             disable_web_page_preview=True)
 
     elif data == "confirm_cancel":
-        await query.edit_message_reply_markup(reply_markup=None)
         sub = get_subscription(tid)
         razorpay_sub_id = sub.get("razorpay_sub_id") if sub else None
         if razorpay_sub_id:
@@ -1267,7 +1265,6 @@ async def handle_callback(update, context):
             await query.message.reply_text("Your subscription has been cancelled.")
 
     elif data == "keep_sub":
-        await query.edit_message_reply_markup(reply_markup=None)
         await query.message.reply_text("\U0001f44d All good! Your subscription is still active.")
 
     elif data == "show_features":
@@ -1288,7 +1285,6 @@ async def handle_callback(update, context):
 
     elif data.startswith("counter_accept:"):
         token = data.replace("counter_accept:", "")
-        await query.edit_message_reply_markup(reply_markup=None)
         try:
             invite = get_invite(token)
             if not invite:
@@ -1315,7 +1311,6 @@ async def handle_callback(update, context):
 
     elif data.startswith("counter_decline:"):
         token = data.replace("counter_decline:", "")
-        await query.edit_message_reply_markup(reply_markup=None)
         update_invite(token, "counter_declined")
         await query.message.reply_text(
             "\u274c *Suggestion declined.* The original event time stands.\n\n"
@@ -1324,7 +1319,6 @@ async def handle_callback(update, context):
 
     elif data == "show_plans":
         from razorpay_billing import PLANS
-        await query.edit_message_reply_markup(reply_markup=None)
         if not RAZORPAY_BILLING_ENABLED:
             await query.message.reply_text("\U0001f4b3 Billing is not configured yet. Check back soon!")
             return
