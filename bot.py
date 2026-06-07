@@ -883,16 +883,12 @@ async def handle_edit_or_delete(update: Update, text: str, telegram_id: int):
 # WELCOME_MESSAGE is now generated dynamically by build_bot_message()
 
 async def build_bot_message(telegram_id: int, is_start: bool = True):
-    """
-    Build the main bot message (used by /start and UNKNOWN intent).
-    Returns (text, keyboard).
-    """
+    """Short punchy message for /start and unknown intent."""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
     creds = get_user_creds(telegram_id)
     allowed, reason = is_subscribed(telegram_id)
 
-    # Determine plan
     plan = "none"
     if reason == "active":
         try:
@@ -905,141 +901,63 @@ async def build_bot_message(telegram_id: int, is_start: bool = True):
     elif reason == "billing_disabled":
         plan = "unlimited"
 
-    locked = plan in ("trial", "basic", "none")
-
-    # Basic features (all plans)
-    basic_features = [
-        ("📝", "Add events by *typing naturally* \u2014 _Dentist tomorrow at 3pm_"),
-        ("🎤", "Send a *voice note* \u2014 speak naturally, I'll extract the event"),
-        ("🖼", "Send a *photo* \u2014 whiteboard, sticky note, handwritten list"),
-        ("📄", "Send a *PDF* \u2014 meeting notes, documents, any file with dates"),
-        ("🔄", "Add *recurring events* \u2014 daily, weekly, monthly, every weekday"),
-        ("⏰", "*Auto reminders* \u2014 15 min and 5 min before every event, always"),
-        ("✏️", "*Edit events* conversationally \u2014 _Move my dentist to 4pm_"),
-        ("🗑", "*Delete events* conversationally \u2014 _Cancel my Monday meeting_"),
-        ("📋", "*View upcoming events* \u2014 _Show my schedule_"),
-    ]
-
-    # Pro-only features
-    pro_features = [
-        ("📨", "*Invite people* to meetings \u2014 _Invite Rahul to my 3pm call_"),
-        ("🔁", "Invitees can *accept, decline, or suggest a different time*"),
-    ]
-
-    lines_basic = "\n\n".join(f"{e} {t}" for e, t in basic_features)
-    if locked:
-        lines_pro = "\n\n".join(f"\U0001f512 {e} {t} _(Pro only)_" for e, t in pro_features)
-    else:
-        lines_pro = "\n\n".join(f"{e} {t}" for e, t in pro_features)
-
-    plan_section = (
-        "💳 *Plans*\n\n"
-        "*Basic \u2014 \u20b9199/month*\n"
-        "All input types, recurring events, reminders, edit & delete, view schedule\n\n"
-        "*Pro \u2014 \u20b9499/month*\n"
-        "Everything in Basic + calendar invites, invite responses, priority support"
-    )
-
-    if plan == "unlimited":
-        status_block = ""
-    elif plan == "pro":
-        status_block = (
-            "\n\n👑 *You're on the Pro plan \u2014 full access unlocked!*\n"
-            "You have every feature at your fingertips. Make the most of it!"
+    if not is_start:
+        intro = (
+            "❌ *That's not something I can help with.*\n\n"
+            "Here's a guide on how to use CalendarBot better:\n\n"
         )
+    elif not creds:
+        intro = (
+            "👋 *Welcome to CalendarBot!*\n\n"
+            "Stop switching between apps to manage your calendar. "
+            "Just *chat* — add events, set reminders, invite people, "
+            "and manage everything from Telegram.\n\n"
+        )
+    elif plan == "pro":
+        intro = "👋 *Welcome back!* You have full Pro access — here's everything you can do:\n\n"
+    elif plan == "basic":
+        intro = "👋 *Welcome back!* Here's what you can do — and how to get more:\n\n"
+    elif plan == "trial":
+        days = reason.split(":")[1]
+        intro = f"👋 *Welcome back!* You have *{days} trial day(s) left*\n\n"
+    else:
+        intro = "👋 *Welcome back!*\n\n"
+
+    if plan in ("unlimited", "pro"):
+        status_block = ""
     elif plan == "basic":
         status_block = (
-            "\n\n✅ *You're on the Basic plan*\n"
-            "Upgrade to Pro to unlock calendar invites and priority support."
+            "✅ *Basic plan active*\n"
+            "Upgrade to Pro to unlock calendar invites and invite responses.\n\n"
         )
     elif plan == "trial":
         days = reason.split(":")[1]
         status_block = (
-            f"\n\n⏳ *Free trial \u2014 {days} day(s) left*\n"
-            "Pro features above are locked during your trial. Subscribe to unlock everything."
+            f"⏳ *You are on a free trial — {days} day(s) left*\n"
+            "Subscribe before your trial ends to keep everything running.\n\n"
         )
     elif reason == "trial_expired":
-        status_block = (
-            "\n\n🔒 *Your free trial has ended.*\n"
-            "Subscribe to continue using CalendarBot."
-        )
+        status_block = "🔒 *Your free trial has ended.* Subscribe to continue.\n\n"
     else:
-        status_block = (
-            "\n\n🔒 *Subscription inactive.*\n"
-            "Reactivate to continue using CalendarBot."
-        )
+        status_block = "🔒 *Subscription inactive.* Reactivate to continue.\n\n"
 
     assurance = (
-        "\n\n🤝 *Whatever you type, we've got you.*\n"
-        "Just chat naturally \u2014 no commands needed. "
+        "🤝 *Whatever you type, we've got you.*\n"
+        "Just chat naturally — no commands needed. "
         "If we don't understand, we'll guide you. Support is always one tap away."
     )
 
-    if not creds:
-        if is_start:
-            intro = (
-                "👋 *Welcome to CalendarBot!*\n\n"
-                "Stop switching between apps to manage your calendar. "
-                "Just *chat* \u2014 add events, set reminders, invite people, "
-                "and manage everything from Telegram.\n\n"
-                "Here's everything CalendarBot can do for you:\n\n"
-            )
-        else:
-            intro = (
-                "📅 *You haven't connected your Google Calendar yet.*\n\n"
-                "Here's what CalendarBot can do for you once you connect:\n\n"
-            )
-    else:
-        if plan == "pro":
-            intro = "👋 *Welcome back!* Here's everything at your disposal:\n\n"
-        elif plan == "basic":
-            intro = (
-                "👋 *Welcome back!* Here's how to get the most out of CalendarBot"
-                " \u2014 and what you're missing on Basic:\n\n"
-            )
-        elif plan == "trial":
-            days = reason.split(":")[1]
-            intro = (
-                f"👋 *Welcome back!* You have *{days} trial day(s) left*"
-                " \u2014 here's everything CalendarBot can do:\n\n"
-            )
-        else:
-            intro = "👋 *Welcome back!* Here's what CalendarBot can do:\n\n"
-        if not is_start:
-            intro = "🤔 *Not sure what you meant \u2014 but here's what I can do:*\n\n"
+    text = intro + status_block + assurance
 
-    other_commands = (
-        "\U0001f4cb *Other commands \u2014 just type naturally:*\n\n"
-        "\u2022 _Show my upcoming events_\n"
-        "\u2022 _Am I connected?_\n"
-        "\u2022 _Disconnect my Google account_\n"
-        "\u2022 _plans_ or _pricing_ \u2014 see subscription options\n"
-        "\u2022 _upgrade_ or _upgrade to pro_ \u2014 upgrade your plan\n"
-        "\u2022 _cancel subscription_ \u2014 cancel your plan"
-    )
-
-    text = (
-        intro
-        + lines_basic
-        + "\n\n"
-        + lines_pro
-        + "\n\n\u2014\u2014\u2014\n\n"
-        + other_commands
-        + "\n\n\u2014\u2014\u2014\n\n"
-        + plan_section
-        + status_block
-        + assurance
-    )
-
-    # Build keyboard
     button_rows = []
     if not creds:
         auth_url = make_auth_url(telegram_id)
         button_rows.append([InlineKeyboardButton("📅 Connect Google Calendar", url=auth_url)])
+    button_rows.append([InlineKeyboardButton("📋 Features", callback_data="show_features")])
     if plan in ("trial", "none") or reason in ("trial_expired", "cancelled", "expired"):
-        button_rows.append([InlineKeyboardButton("💳 See Subscription Plans", callback_data="show_plans")])
+        button_rows.append([InlineKeyboardButton("💳 Subscribe", callback_data="show_plans")])
     elif plan == "basic":
-        button_rows.append([InlineKeyboardButton("⬆️ Upgrade to Pro \u2014 \u20b9499/mo", callback_data="subscribe_pro")])
+        button_rows.append([InlineKeyboardButton("⬆️ Upgrade to Pro — ₹499/mo", callback_data="subscribe_pro")])
     button_rows.append([
         InlineKeyboardButton("💬 WhatsApp Support", url="https://wa.me/919496784855"),
         InlineKeyboardButton("✉️ Email Us", url="https://mail.google.com/mail/?view=cm&to=abhijitsuresh99@gmail.com"),
@@ -1047,6 +965,48 @@ async def build_bot_message(telegram_id: int, is_start: bool = True):
 
     keyboard = InlineKeyboardMarkup(button_rows)
     return text, keyboard
+
+
+def build_features_text(plan: str) -> str:
+    """Full feature list with Pro locks based on plan."""
+    locked = plan in ("trial", "basic", "none")
+
+    text = (
+        "📋 *CalendarBot Features*\n\n"
+        "*Adding events:*\n"
+        "Send a text, voice note, photo, PDF or a handwritten list of the meeting details — "
+        "I'll extract and add it to your Google Calendar automatically.\n\n"
+        "🔄 *Recurring events* — _Team standup every Monday at 10am_\n\n"
+        "⏰ *Auto reminders* — 15 min and 5 min before every event, always\n\n"
+        "✏️ *Edit events* — _Move my dentist to 4pm_\n\n"
+        "🗑 *Delete events* — _Cancel my Monday meeting_\n\n"
+        "📋 *View upcoming events* — _Show my schedule_\n\n"
+    )
+
+    if locked:
+        text += (
+            "🔒 📨 *Invite people to meetings* _(Pro only)_\n\n"
+            "🔒 🔁 *Invitees can accept, decline, or suggest a different time* _(Pro only)_\n\n"
+        )
+    else:
+        text += (
+            "📨 *Invite people to meetings* — _Invite Rahul to my 3pm call_\n\n"
+            "🔁 *Invitees can accept, decline, or suggest a different time*\n\n"
+        )
+
+    text += (
+        "———\n\n"
+        "*Other things you can type or say:*\n\n"
+        "• _Show my upcoming events_\n"
+        "• _Am I connected?_\n"
+        "• _Disconnect my Google account_\n"
+        "• _plans_ or _pricing_ — see subscription options\n"
+        "• _upgrade_ or _upgrade to pro_ — upgrade your plan\n"
+        "• _cancel subscription_ — cancel your plan\n"
+        "• _help_ — see this guide anytime"
+    )
+
+    return text
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1310,8 +1270,57 @@ async def handle_callback(update, context):
         await query.edit_message_reply_markup(reply_markup=None)
         await query.message.reply_text("\U0001f44d All good! Your subscription is still active.")
 
-    elif data == "noop":
-        pass  # Info-only buttons, no action needed
+    elif data == "show_features":
+        allowed, reason = is_subscribed(tid)
+        plan = "none"
+        if reason == "active":
+            try:
+                sub = get_subscription(tid)
+                plan = sub.get("plan", "basic") if sub else "basic"
+            except Exception:
+                plan = "basic"
+        elif reason.startswith("trial:"):
+            plan = "trial"
+        elif reason == "billing_disabled":
+            plan = "unlimited"
+        features_text = build_features_text(plan)
+        await query.message.reply_text(features_text, parse_mode="Markdown")
+
+    elif data.startswith("counter_accept:"):
+        token = data.replace("counter_accept:", "")
+        await query.edit_message_reply_markup(reply_markup=None)
+        try:
+            invite = get_invite(token)
+            if not invite:
+                await query.message.reply_text("\u274c Invite not found or already handled.")
+                return
+            counter_date = invite.get("counter_date")
+            counter_time = invite.get("counter_time")
+            ev = json.loads(invite["event_data"])
+            ev["date"] = counter_date
+            ev["start_time"] = counter_time
+            service = get_calendar_service(tid)
+            if service:
+                add_event(service, ev)
+                update_invite(token, "accepted")
+                await query.message.reply_text(
+                    f"\u2705 *Done!* Rescheduled *{ev.get('title')}* to *{counter_date}* at *{counter_time}*.\n"
+                    f"The event has been updated in your Google Calendar.",
+                    parse_mode="Markdown")
+            else:
+                await query.message.reply_text("\u274c Could not update \u2014 your Google Calendar is disconnected. Send /start to reconnect.")
+        except Exception as e:
+            logger.error(f"Counter accept error: {e}")
+            await query.message.reply_text("\u274c Something went wrong. Please update the event manually.")
+
+    elif data.startswith("counter_decline:"):
+        token = data.replace("counter_decline:", "")
+        await query.edit_message_reply_markup(reply_markup=None)
+        update_invite(token, "counter_declined")
+        await query.message.reply_text(
+            "\u274c *Suggestion declined.* The original event time stands.\n\n"
+            "You can send them a new invite anytime by messaging me.",
+            parse_mode="Markdown")
 
     elif data == "show_plans":
         from razorpay_billing import PLANS
@@ -1692,14 +1701,24 @@ class Handler(BaseHTTPRequestHandler):
             organiser_id = invite["organiser_telegram_id"]
             if telegram_app:
                 import asyncio
+                from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+                counter_keyboard = InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton(f"\u2705 Accept \u2014 {counter_date} at {counter_time}", callback_data=f"counter_accept:{token}"),
+                    ],
+                    [
+                        InlineKeyboardButton("\u274c Decline \u2014 keep original time", callback_data=f"counter_decline:{token}"),
+                    ]
+                ])
                 asyncio.run_coroutine_threadsafe(
                     telegram_app.bot.send_message(
                         chat_id=organiser_id,
-                        text=f"💬 *{name} suggested a different time*\n\n"
-                             f"• Original: *{ev.get('title')}* — {ev.get('date','')} {ev.get('start_time','')}\n"
-                             f"• Suggested: *{counter_date}* at *{counter_time}*\n\n"
-                             f"Reply to this message or update the event manually.",
-                        parse_mode="Markdown"),
+                        text=f"\U0001f4ac *{name} suggested a different time*\n\n"
+                             f"\u2022 Event: *{ev.get('title')}*\n"
+                             f"\u2022 Original: *{ev.get('date','')}* at *{ev.get('start_time','')}*\n"
+                             f"\u2022 Suggested: *{counter_date}* at *{counter_time}*",
+                        parse_mode="Markdown",
+                        reply_markup=counter_keyboard),
                     telegram_app.update_queue._loop
                         if hasattr(telegram_app.update_queue, "_loop")
                         else asyncio.new_event_loop()
